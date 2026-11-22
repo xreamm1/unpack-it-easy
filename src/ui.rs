@@ -1706,6 +1706,15 @@ fn highlight(text: &str) -> egui::text::LayoutJob {
     job
 }
 
+// Context accessors lock the same egui state. Never call one inside input_mut.
+fn consume_rename_shortcut(ctx: &egui::Context, editor_focused: bool) -> bool {
+    let allow_n = editor_focused || !ctx.wants_keyboard_input();
+    ctx.input_mut(|input| {
+        (allow_n && input.consume_key(egui::Modifiers::NONE, egui::Key::N))
+            || input.consume_key(egui::Modifiers::NONE, egui::Key::F2)
+    })
+}
+
 impl eframe::App for Toker {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         crate::language::set(self.settings.english);
@@ -1765,11 +1774,7 @@ impl eframe::App for Toker {
         if self.tab == 0
             && !self.rename_open
             && !self.busy
-            && ctx.input_mut(|i| {
-                ((self.editor_focused || !ctx.wants_keyboard_input())
-                    && i.consume_key(egui::Modifiers::NONE, egui::Key::N))
-                    || i.consume_key(egui::Modifiers::NONE, egui::Key::F2)
-            })
+            && consume_rename_shortcut(ctx, self.editor_focused)
         {
             ctx.input_mut(|i| {
                 i.events
@@ -2095,6 +2100,32 @@ impl Drop for Toker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn code_tab_shortcut_does_not_reenter_context_lock() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                assert!(!consume_rename_shortcut(ctx, false));
+            });
+            let mut raw = egui::RawInput::default();
+            raw.events.push(egui::Event::Key {
+                key: egui::Key::N,
+                physical_key: Some(egui::Key::N),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let mut renamed = false;
+            let _ = ctx.run(raw, |ctx| {
+                renamed |= consume_rename_shortcut(ctx, false);
+            });
+            tx.send(renamed).unwrap();
+        });
+        assert!(rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("code tab deadlocked while polling the rename shortcut"));
+    }
     #[test]
     fn event_flood_is_bounded_and_workspace_loads_in_background() {
         let context = egui::Context::default();
