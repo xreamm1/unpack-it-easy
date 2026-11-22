@@ -201,8 +201,11 @@ for($attempt=0;$attempt -lt 20;$attempt++){{
 pub fn install(staged: &Path, hash: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let helper = staged.with_extension("ps1");
-    fs::write(&helper, script(&exe, staged, hash, std::process::id()))
-        .map_err(|e| e.to_string())?;
+    fs::write(
+        &helper,
+        format!("\u{feff}{}", script(&exe, staged, hash, std::process::id())),
+    )
+    .map_err(|e| e.to_string())?;
     let mut command = Command::new("powershell.exe");
     command
         .args([
@@ -231,7 +234,7 @@ mod tests {
     #[cfg(windows)]
     fn installer_replaces_only_after_hash_verification() {
         use std::os::windows::process::CommandExt;
-        let root = std::env::temp_dir().join(format!("uie-install-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("uie-install-тест-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let target = root.join("UIE.exe");
         let staged = root.join("new.exe");
@@ -241,7 +244,7 @@ mod tests {
         let mut text = script(&target, &staged, &hash, 99_999_999);
         text = text.replace("[void][Diagnostics.Process]::Start($startInfo);", "");
         let helper = root.join("test.ps1");
-        fs::write(&helper, text).unwrap();
+        fs::write(&helper, format!("\u{feff}{text}")).unwrap();
         let status = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
