@@ -1,0 +1,12 @@
+/target/
+/dist/
+/engines/
+/results/
+/projects/
+*.exe
+*.uie
+*.toker
+__pycache__/
+*.pyc
+*.log
+.env
