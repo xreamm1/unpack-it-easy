@@ -36,6 +36,7 @@ pub struct Settings {
     pub force_rebuild: bool,
     pub english: bool,
     pub offline: bool,
+    pub hide_updates: bool,
 }
 
 pub enum Event {

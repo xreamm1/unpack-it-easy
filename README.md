@@ -22,6 +22,14 @@ Select **English** or **русский** in the toolbar.
 - Portable `.uie` project databases with resources, reports and rename history; legacy `.toker` loading.
 - New result directories and the primary output use `<application>_decompiled`.
 
+## Updates and responsiveness
+
+On startup UIE checks the latest stable GitHub release in a background worker with a timeout. The dialog offers **update**, **later** and **do not show again**. The last choice disables automatic checks; the toolbar still allows a manual check. Offline mode skips checks and downloads.
+
+An accepted update is downloaded in the background and checked against the release asset SHA-256. Unsaved edits must be saved before restarting. A helper waits for UIE to exit and atomically replaces the executable, preserving a backup and the engines/projects folders.
+
+Result discovery, source reading and symbol indexing run in background workers. Event processing is limited per frame and log writes are batched. Files initially use virtualized viewing; select edit to modify the source. Very long lines show their first 8192 characters in viewing mode; complete source is retained on disk and in project databases.
+
 ## Offline mode
 
 While online, select a Python version or **all python versions**, then click **download offline bundle**. This prepares DIE, Python/PyLingual, Ghidra/Java, ILSpy and CFR, plus the selected Python interpreters and model snapshots under `engines`. The all-versions option prepares Python **3.8–3.14** and requires multiple gigabytes. Preparation can be cancelled and rerun; successful version preparations are recorded in `engines/offline-ready.json`.

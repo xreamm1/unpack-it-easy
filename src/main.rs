@@ -11,6 +11,7 @@ mod runtime;
 mod telemetry;
 mod triage;
 mod ui;
+mod updater;
 use engine::{Event, Settings};
 use std::{
     fs,

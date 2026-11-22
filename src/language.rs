@@ -40,6 +40,19 @@ fn translate(text: &str, english: bool) -> String {
 }
 
 const TRANSLATIONS: &[(&str, &str)] = &[
+    ("проверить обновления", "check for updates"),
+    ("проверка обновлений", "checking for updates"),
+    ("доступно обновление", "update available"),
+    ("обновить", "update"),
+    ("позже", "later"),
+    ("больше не показывать", "do not show again"),
+    ("загрузка обновления", "downloading update"),
+    ("перезапустить и обновить", "restart and update"),
+    ("обновлений нет", "no updates available"),
+    (
+        "очень длинные строки показаны до 8192 символов в просмотре",
+        "very long lines show the first 8192 characters in viewing mode",
+    ),
     ("офлайн", "offline"),
     ("все версии python", "all python versions"),
     ("скачать офлайн-комплект", "download offline bundle"),

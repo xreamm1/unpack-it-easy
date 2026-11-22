@@ -8,7 +8,7 @@ use eframe::egui::{self, Color32, RichText};
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -59,7 +59,7 @@ impl Document {
             galley_len: 0,
         };
         doc.reindex();
-        doc.fast_view = doc.line_starts.len() > 4000 || doc.text.len() > 512 * 1024;
+        doc.fast_view = true;
         doc
     }
     fn reindex(&mut self) {
@@ -136,229 +136,98 @@ struct NativeReport {
     lines: HashMap<String, usize>,
 }
 
-pub struct Toker {
-    settings: Settings,
-    input: Option<PathBuf>,
-    analysis: Option<Analysis>,
+struct LoadedWorkspace {
     output: Option<PathBuf>,
     files: Vec<PathBuf>,
     documents: Vec<Document>,
     active: Option<usize>,
     tab: usize,
-    logs: String,
     status: String,
-    stage: usize,
-    busy: bool,
-    complete: bool,
-    receiver: Option<mpsc::Receiver<Event>>,
-    cancel: Arc<AtomicBool>,
-    close_after_cancel: bool,
-    confirm_close: bool,
-    allow_close: bool,
-    search: String,
-    scroll_to_line: Option<usize>,
-    queued_input: Option<PathBuf>,
     session: Session,
-    clock: StageClock,
-    base_dirty: bool,
-    base_path: Option<PathBuf>,
-    input_hash: String,
-    verification: String,
-    log_file: Option<PathBuf>,
-    cursor_line: Option<usize>,
-    avatar: egui::TextureHandle,
     native_reports: Vec<NativeReport>,
     triage_report: Option<String>,
-    indicators: Option<crate::indicators::Report>,
-    ioc_filter: String,
-    rename_open: bool,
-    rename_from: String,
-    rename_to: String,
-    visible_lines: (usize, usize),
-    editor_character: usize,
-    editor_focused: bool,
-    offline_versions: String,
 }
-
-impl Toker {
-    pub fn new(input: Option<PathBuf>, avatar: egui::TextureHandle) -> Self {
-        let settings = Settings::load();
-        crate::language::set(settings.english);
-        let mut app = Self {
-            settings,
-            input: None,
-            analysis: None,
-            output: None,
+impl LoadedWorkspace {
+    fn read(output: PathBuf, session: Session) -> Self {
+        let mut loaded = Self {
+            output: Some(output),
             files: vec![],
             documents: vec![],
             active: None,
-            tab: 1,
-            logs: String::new(),
-            status: tr("загрузи файл — движок будет выбран автоматически"),
-            stage: 0,
-            busy: false,
-            complete: false,
-            receiver: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            close_after_cancel: false,
-            confirm_close: false,
-            allow_close: false,
-            search: String::new(),
-            scroll_to_line: None,
-            queued_input: input,
-            session: Session::default(),
-            clock: StageClock::default(),
-            base_dirty: false,
-            base_path: None,
-            input_hash: String::new(),
-            verification: String::new(),
-            log_file: None,
-            cursor_line: None,
-            avatar,
+            tab: 0,
+            status: String::new(),
+            session,
             native_reports: vec![],
             triage_report: None,
-            indicators: None,
-            ioc_filter: String::new(),
-            rename_open: false,
-            rename_from: String::new(),
-            rename_to: String::new(),
-            visible_lines: (0, 50),
-            editor_character: 0,
-            editor_focused: false,
-            offline_versions: "all".into(),
         };
-        if let Some(path) = app
-            .queued_input
-            .as_ref()
-            .filter(|p| telemetry::is_base(p))
-            .cloned()
-        {
-            app.queued_input = None;
-            app.restore_project(path);
+        loaded.load_sources();
+        if let (Some(root), Some(relative)) = (&loaded.output, &loaded.session.active_file) {
+            if relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                loaded.open_document(root.join(relative));
+            }
         }
-        app
+        loaded.load_problems();
+        loaded.load_native_reports();
+        loaded
     }
-
-    fn restore_project(&mut self, path: PathBuf) {
-        match crate::project::open(&path) {
-            Ok(project) => {
-                self.input = Some(path.clone());
-                self.base_path = Some(path);
-                self.input_hash = project.input_sha256.clone();
-                self.verification = project.verification.clone();
-                self.base_dirty = false;
-                self.analysis = Some(project.analysis);
-                self.indicators = fs::read(project.output.join("indicators.json"))
-                    .ok()
-                    .and_then(|data| serde_json::from_slice(&data).ok());
-                self.output = Some(project.output);
-                self.session = self
-                    .output
-                    .as_ref()
-                    .and_then(|p| fs::read(p.join("uie-session.json")).ok())
-                    .and_then(|data| serde_json::from_slice(&data).ok())
-                    .unwrap_or_default();
-                self.search = self.session.search.clone();
-                self.clock = StageClock::default();
-                self.logs.clear();
-                self.log_file = None;
-                if let Some(output) = self.output.clone() {
-                    self.attach_log(&output);
+    fn load_sources(&mut self) {
+        if let Some(output) = &self.output {
+            let mut folders = vec![output.join("source")];
+            if let Some(native) = crate::project::native_source(output) {
+                self.files.push(native);
+            }
+            let mut visited = 0usize;
+            while let Some(folder) = folders.pop() {
+                visited += 1;
+                if visited > 100_000 {
+                    break;
                 }
-                self.files.clear();
-                self.documents.clear();
-                self.active = None;
-                self.complete = true;
-                self.stage = 6;
-                self.status = project.verification.clone();
-                self.log(&project.verification);
-                self.load_sources();
-                if let (Some(output), Some(relative)) =
-                    (self.output.clone(), self.session.active_file.clone())
-                {
-                    if relative
-                        .components()
-                        .all(|c| matches!(c, std::path::Component::Normal(_)))
-                    {
-                        self.open_document(output.join(relative));
+                if let Ok(entries) = fs::read_dir(folder) {
+                    for entry in entries.flatten() {
+                        if let Ok(kind) = entry.file_type() {
+                            if kind.is_dir()
+                                && entry.file_name() != ".uie-scripts"
+                                && !(entry.file_name() == "scripts"
+                                    && entry.path().join("UieExport.java").is_file())
+                            {
+                                folders.push(entry.path());
+                            } else if kind.is_file()
+                                && entry.path().extension().is_some_and(|e| {
+                                    [
+                                        "py", "cs", "c", "h", "java", "js", "ts", "jsx", "tsx",
+                                        "json", "html", "css", "mjs", "cjs",
+                                    ]
+                                    .iter()
+                                    .any(|x| e == *x)
+                                })
+                            {
+                                self.files.push(entry.path());
+                            }
+                        }
                     }
                 }
-                self.load_problems();
-                self.load_native_reports();
-                self.tab = self.session.tab.min(3);
             }
-            Err(error) => self.status = error,
-        }
-    }
-    fn log(&mut self, text: &str) {
-        if let Some(path) = &self.log_file {
-            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "{text}");
-            }
-        }
-        self.logs.push_str(text);
-        if !text.ends_with('\n') {
-            self.logs.push('\n');
-        }
-        if self.logs.len() > MAX_LOG_BYTES {
-            let mut boundary = self.logs.len() - MAX_LOG_BYTES;
-            while !self.logs.is_char_boundary(boundary) {
-                boundary += 1;
-            }
-            self.logs.drain(..boundary);
-        }
-    }
-    fn has_unsaved(&self) -> bool {
-        self.base_dirty || self.documents.iter().any(|doc| doc.dirty)
-    }
-
-    fn attach_log(&mut self, output: &std::path::Path) {
-        let path = output.join("uie-session.log");
-        let prefix = self.logs.clone();
-        if let Ok(bytes) = fs::read(&path) {
-            self.logs = String::from_utf8_lossy(&bytes).into_owned();
-            if self.logs.len() > MAX_LOG_BYTES {
-                let mut start = self.logs.len() - MAX_LOG_BYTES;
-                while !self.logs.is_char_boundary(start) {
-                    start += 1;
-                }
-                self.logs.drain(..start);
-            }
-        }
-        self.log_file = Some(path);
-        if !prefix.is_empty() {
-            self.log(&prefix);
-        }
-    }
-
-    fn full_log(&self) -> String {
-        self.log_file
-            .as_ref()
-            .and_then(|p| fs::read(p).ok())
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_else(|| self.logs.clone())
-    }
-
-    fn persist_session(&mut self) {
-        if let Some(output) = &self.output {
-            self.session.active_file = self.active.and_then(|index| {
-                self.documents[index]
-                    .path
-                    .strip_prefix(output)
-                    .ok()
-                    .map(std::path::Path::to_path_buf)
-            });
-            self.session.search = self.search.clone();
-            self.session.tab = self.tab;
-            if let Ok(data) = serde_json::to_vec_pretty(&self.session) {
-                let _ = fs::write(output.join("uie-session.json"), data);
-                if let Ok(bytes) = serde_json::to_vec_pretty(&self.session.renames) {
-                    let _ = fs::write(output.join("renames.json"), bytes);
-                }
+            self.files.sort();
+            let preferred = self
+                .files
+                .iter()
+                .find(|p| {
+                    p.file_name().is_some_and(|n| {
+                        n.to_string_lossy().ends_with("_decompiled.py")
+                            || n == "decompiled_app.py"
+                            || n == "app.py"
+                    })
+                })
+                .or_else(|| self.files.first())
+                .cloned();
+            if let Some(path) = preferred {
+                self.open_document(path);
             }
         }
     }
-
     fn load_problems(&mut self) {
         if let Some(output) = &self.output {
             if let Some(report) = fs::read(output.join("objects-report.json"))
@@ -395,31 +264,6 @@ impl Toker {
             }
         }
     }
-
-    fn jump_to_problem(&mut self, problem: &Problem) {
-        if problem.file.is_absolute()
-            || problem
-                .file
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return;
-        }
-        if let Some(output) = &self.output {
-            let path = output.join(&problem.file);
-            if !path.is_file() {
-                self.status = tr("исходник для объекта не создан");
-                return;
-            }
-            self.open_document(path);
-            let line = problem.line.saturating_sub(1);
-            self.scroll_to_line = Some(line);
-            self.cursor_line = Some(line);
-            self.tab = 0;
-            self.status = format!("{}: {}", problem.symbol, problem.message);
-        }
-    }
-
     fn load_native_reports(&mut self) {
         self.native_reports.clear();
         self.triage_report = None;
@@ -428,7 +272,12 @@ impl Toker {
         };
         self.triage_report = fs::read_to_string(output.join("triage-report.json")).ok();
         let mut folders = vec![output.clone()];
+        let mut visited = 0usize;
         while let Some(folder) = folders.pop() {
+            visited += 1;
+            if visited > 100_000 {
+                break;
+            }
             if let Ok(bytes) = fs::read(folder.join("native-report.json")) {
                 if let Ok(report) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     let name = report["source_file"]
@@ -491,6 +340,377 @@ impl Toker {
                     }
                 }
             }
+        }
+    }
+    fn open_document(&mut self, path: PathBuf) {
+        if let Some(index) = self.documents.iter().position(|d| d.path == path) {
+            self.active = Some(index);
+            self.tab = 0;
+            return;
+        }
+        match fs::metadata(&path).and_then(|m| {
+            if m.len() > MAX_EDITOR_BYTES {
+                return Err(std::io::Error::other(tr(
+                    "файл больше лимита редактора 32 MiB",
+                )));
+            }
+            fs::read_to_string(&path)
+        }) {
+            Ok(text) => {
+                self.documents.push(Document::new(path, text));
+                self.active = Some(self.documents.len() - 1);
+                self.tab = 0;
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+}
+
+pub struct Toker {
+    settings: Settings,
+    input: Option<PathBuf>,
+    analysis: Option<Analysis>,
+    output: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    documents: Vec<Document>,
+    active: Option<usize>,
+    tab: usize,
+    logs: String,
+    status: String,
+    stage: usize,
+    busy: bool,
+    complete: bool,
+    receiver: Option<mpsc::Receiver<Event>>,
+    cancel: Arc<AtomicBool>,
+    close_after_cancel: bool,
+    confirm_close: bool,
+    allow_close: bool,
+    search: String,
+    scroll_to_line: Option<usize>,
+    queued_input: Option<PathBuf>,
+    session: Session,
+    clock: StageClock,
+    base_dirty: bool,
+    base_path: Option<PathBuf>,
+    input_hash: String,
+    verification: String,
+    log_file: Option<PathBuf>,
+    cursor_line: Option<usize>,
+    avatar: egui::TextureHandle,
+    native_reports: Vec<NativeReport>,
+    triage_report: Option<String>,
+    indicators: Option<crate::indicators::Report>,
+    ioc_filter: String,
+    rename_open: bool,
+    rename_from: String,
+    rename_to: String,
+    visible_lines: (usize, usize),
+    editor_character: usize,
+    editor_focused: bool,
+    offline_versions: String,
+    update_checked: bool,
+    update_rx: Option<mpsc::Receiver<crate::updater::Message>>,
+    available_update: Option<crate::updater::Release>,
+    downloaded_update: Option<PathBuf>,
+    workspace_rx: Option<mpsc::Receiver<LoadedWorkspace>>,
+    document_rx: Option<mpsc::Receiver<Result<Document, String>>>,
+}
+
+impl Toker {
+    fn apply_update(&mut self, ctx: &egui::Context) {
+        if self.busy {
+            return;
+        }
+        if self.has_unsaved() && !self.save_base() {
+            return;
+        }
+        let Some(path) = &self.downloaded_update else {
+            return;
+        };
+        let Some(release) = &self.available_update else {
+            return;
+        };
+        match crate::updater::install(path, &release.sha256) {
+            Ok(()) => {
+                self.persist_session();
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => self.status = error,
+        }
+    }
+    fn updates(&mut self, ctx: &egui::Context) {
+        if !self.update_checked && !self.settings.hide_updates && !self.settings.offline {
+            self.update_checked = true;
+            self.update_rx = Some(crate::updater::start_check());
+        }
+        if let Some(message) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.update_rx = None;
+            match message {
+                crate::updater::Message::Checked(Ok(Some(release))) => {
+                    self.available_update = Some(release)
+                }
+                crate::updater::Message::Checked(Ok(None)) => {
+                    if !self.busy {
+                        self.status = tr("обновлений нет");
+                    }
+                }
+                crate::updater::Message::Checked(Err(error))
+                | crate::updater::Message::Downloaded(Err(error)) => self.log(&error),
+                crate::updater::Message::Downloaded(Ok(path)) => {
+                    self.downloaded_update = Some(path);
+                    if !self.busy && !self.has_unsaved() {
+                        self.apply_update(ctx);
+                    }
+                }
+            }
+        }
+        if let Some(release) = self.available_update.clone() {
+            let mut open = true;
+            egui::Window::new(tr("доступно обновление"))
+                .id(egui::Id::new("update-dialog"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "UIE {} → {}",
+                        env!("CARGO_PKG_VERSION"),
+                        release.version
+                    ));
+                    if self.update_rx.is_some() {
+                        ui.spinner();
+                        ui.label(tr("загрузка обновления"));
+                    }
+                    let label = if self.downloaded_update.is_some() {
+                        tr("перезапустить и обновить")
+                    } else {
+                        tr("обновить")
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.settings.offline && self.update_rx.is_none(),
+                            egui::Button::new(label),
+                        )
+                        .clicked()
+                    {
+                        if self.downloaded_update.is_some() {
+                            self.apply_update(ctx);
+                        } else if !self.has_unsaved() || self.save_base() {
+                            self.update_rx = Some(crate::updater::start_download(release));
+                        }
+                    }
+                    if ui.button(tr("позже")).clicked() {
+                        self.available_update = None;
+                    }
+                    if ui.button(tr("больше не показывать")).clicked() {
+                        self.settings.hide_updates = true;
+                        let _ = self.settings.save();
+                        self.available_update = None;
+                    }
+                });
+            if !open {
+                self.available_update = None;
+            }
+        }
+    }
+    pub fn new(input: Option<PathBuf>, avatar: egui::TextureHandle) -> Self {
+        let settings = Settings::load();
+        crate::language::set(settings.english);
+        let mut app = Self {
+            settings,
+            input: None,
+            analysis: None,
+            output: None,
+            files: vec![],
+            documents: vec![],
+            active: None,
+            tab: 1,
+            logs: String::new(),
+            status: tr("загрузи файл — движок будет выбран автоматически"),
+            stage: 0,
+            busy: false,
+            complete: false,
+            receiver: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            close_after_cancel: false,
+            confirm_close: false,
+            allow_close: false,
+            search: String::new(),
+            scroll_to_line: None,
+            queued_input: input,
+            session: Session::default(),
+            clock: StageClock::default(),
+            base_dirty: false,
+            base_path: None,
+            input_hash: String::new(),
+            verification: String::new(),
+            log_file: None,
+            cursor_line: None,
+            avatar,
+            native_reports: vec![],
+            triage_report: None,
+            indicators: None,
+            ioc_filter: String::new(),
+            rename_open: false,
+            rename_from: String::new(),
+            rename_to: String::new(),
+            visible_lines: (0, 50),
+            editor_character: 0,
+            editor_focused: false,
+            offline_versions: "all".into(),
+            update_checked: false,
+            update_rx: None,
+            available_update: None,
+            downloaded_update: None,
+            workspace_rx: None,
+            document_rx: None,
+        };
+        if let Some(path) = app
+            .queued_input
+            .as_ref()
+            .filter(|p| telemetry::is_base(p))
+            .cloned()
+        {
+            app.queued_input = None;
+            app.restore_project(path);
+        }
+        app
+    }
+
+    fn restore_project(&mut self, path: PathBuf) {
+        match crate::project::open(&path) {
+            Ok(project) => {
+                self.input = Some(path.clone());
+                self.base_path = Some(path);
+                self.input_hash = project.input_sha256.clone();
+                self.verification = project.verification.clone();
+                self.base_dirty = false;
+                self.analysis = Some(project.analysis);
+                self.indicators = fs::read(project.output.join("indicators.json"))
+                    .ok()
+                    .and_then(|data| serde_json::from_slice(&data).ok());
+                self.output = Some(project.output);
+                self.session = self
+                    .output
+                    .as_ref()
+                    .and_then(|p| fs::read(p.join("uie-session.json")).ok())
+                    .and_then(|data| serde_json::from_slice(&data).ok())
+                    .unwrap_or_default();
+                self.search = self.session.search.clone();
+                self.clock = StageClock::default();
+                self.logs.clear();
+                self.log_file = None;
+                if let Some(output) = self.output.clone() {
+                    self.attach_log(&output);
+                }
+                self.files.clear();
+                self.documents.clear();
+                self.active = None;
+                self.complete = true;
+                self.stage = 6;
+                self.status = project.verification.clone();
+                self.log(&project.verification);
+                self.load_sources();
+                self.tab = self.session.tab.min(3);
+            }
+            Err(error) => self.status = error,
+        }
+    }
+    fn log(&mut self, text: &str) {
+        if let Some(path) = &self.log_file {
+            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{text}");
+            }
+        }
+        self.logs.push_str(text);
+        if !text.ends_with('\n') {
+            self.logs.push('\n');
+        }
+        if self.logs.len() > MAX_LOG_BYTES {
+            let mut boundary = self.logs.len() - MAX_LOG_BYTES;
+            while !self.logs.is_char_boundary(boundary) {
+                boundary += 1;
+            }
+            self.logs.drain(..boundary);
+        }
+    }
+    fn has_unsaved(&self) -> bool {
+        self.base_dirty || self.documents.iter().any(|doc| doc.dirty)
+    }
+
+    fn attach_log(&mut self, output: &std::path::Path) {
+        let path = output.join("uie-session.log");
+        let prefix = self.logs.clone();
+        if let Ok(mut file) = fs::File::open(&path) {
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let _ = file.seek(SeekFrom::Start(size.saturating_sub(MAX_LOG_BYTES as u64)));
+            let mut bytes = Vec::new();
+            let _ = file.take(MAX_LOG_BYTES as u64).read_to_end(&mut bytes);
+            self.logs = String::from_utf8_lossy(&bytes).into_owned();
+            if self.logs.len() > MAX_LOG_BYTES {
+                let mut start = self.logs.len() - MAX_LOG_BYTES;
+                while !self.logs.is_char_boundary(start) {
+                    start += 1;
+                }
+                self.logs.drain(..start);
+            }
+        }
+        self.log_file = Some(path);
+        if !prefix.is_empty() {
+            self.log(&prefix);
+        }
+    }
+
+    fn full_log(&self) -> String {
+        self.log_file
+            .as_ref()
+            .and_then(|p| fs::read(p).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|| self.logs.clone())
+    }
+
+    fn persist_session(&mut self) {
+        if let Some(output) = &self.output {
+            self.session.active_file = self.active.and_then(|index| {
+                self.documents[index]
+                    .path
+                    .strip_prefix(output)
+                    .ok()
+                    .map(std::path::Path::to_path_buf)
+            });
+            self.session.search = self.search.clone();
+            self.session.tab = self.tab;
+            if let Ok(data) = serde_json::to_vec_pretty(&self.session) {
+                let _ = fs::write(output.join("uie-session.json"), data);
+                if let Ok(bytes) = serde_json::to_vec_pretty(&self.session.renames) {
+                    let _ = fs::write(output.join("renames.json"), bytes);
+                }
+            }
+        }
+    }
+
+    fn jump_to_problem(&mut self, problem: &Problem) {
+        if problem.file.is_absolute()
+            || problem
+                .file
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return;
+        }
+        if let Some(output) = &self.output {
+            let path = output.join(&problem.file);
+            if !path.is_file() {
+                self.status = tr("исходник для объекта не создан");
+                return;
+            }
+            self.open_document(path);
+            let line = problem.line.saturating_sub(1);
+            self.scroll_to_line = Some(line);
+            self.cursor_line = Some(line);
+            self.tab = 0;
+            self.status = format!("{}: {}", problem.symbol, problem.message);
         }
     }
 
@@ -651,6 +871,8 @@ impl Toker {
             self.restore_project(input);
             return;
         }
+        self.workspace_rx = None;
+        self.document_rx = None;
         self.input = Some(input.clone());
         self.analysis = None;
         self.output = None;
@@ -685,78 +907,7 @@ impl Toker {
         let cancel = self.cancel.clone();
         thread::spawn(move || engine::job(input, settings, true, cancel, tx));
     }
-    fn open_document(&mut self, path: PathBuf) {
-        if let Some(index) = self.documents.iter().position(|d| d.path == path) {
-            self.active = Some(index);
-            self.tab = 0;
-            return;
-        }
-        match fs::metadata(&path).and_then(|m| {
-            if m.len() > MAX_EDITOR_BYTES {
-                return Err(std::io::Error::other(tr(
-                    "файл больше лимита редактора 32 MiB",
-                )));
-            }
-            fs::read_to_string(&path)
-        }) {
-            Ok(text) => {
-                self.documents.push(Document::new(path, text));
-                self.active = Some(self.documents.len() - 1);
-                self.tab = 0;
-            }
-            Err(error) => self.status = error.to_string(),
-        }
-    }
-    fn load_sources(&mut self) {
-        if let Some(output) = &self.output {
-            let mut folders = vec![output.join("source")];
-            if let Some(native) = crate::project::native_source(output) {
-                self.files.push(native);
-            }
-            while let Some(folder) = folders.pop() {
-                if let Ok(entries) = fs::read_dir(folder) {
-                    for entry in entries.flatten() {
-                        if let Ok(kind) = entry.file_type() {
-                            if kind.is_dir()
-                                && entry.file_name() != ".uie-scripts"
-                                && !(entry.file_name() == "scripts"
-                                    && entry.path().join("UieExport.java").is_file())
-                            {
-                                folders.push(entry.path());
-                            } else if kind.is_file()
-                                && entry.path().extension().is_some_and(|e| {
-                                    [
-                                        "py", "cs", "c", "h", "java", "js", "ts", "jsx", "tsx",
-                                        "json", "html", "css", "mjs", "cjs",
-                                    ]
-                                    .iter()
-                                    .any(|x| e == *x)
-                                })
-                            {
-                                self.files.push(entry.path());
-                            }
-                        }
-                    }
-                }
-            }
-            self.files.sort();
-            let preferred = self
-                .files
-                .iter()
-                .find(|p| {
-                    p.file_name().is_some_and(|n| {
-                        n.to_string_lossy().ends_with("_decompiled.py")
-                            || n == "decompiled_app.py"
-                            || n == "app.py"
-                    })
-                })
-                .or_else(|| self.files.first())
-                .cloned();
-            if let Some(path) = preferred {
-                self.open_document(path);
-            }
-        }
-    }
+
     fn save(&mut self, all: bool) -> bool {
         for (index, doc) in self.documents.iter_mut().enumerate() {
             if doc.dirty && (all || self.active == Some(index)) {
@@ -770,11 +921,72 @@ impl Toker {
         self.status = tr("изменения сохранены");
         true
     }
+    fn load_sources(&mut self) {
+        let Some(output) = self.output.clone() else {
+            return;
+        };
+        let session = self.session.clone();
+        let (tx, rx) = mpsc::channel();
+        self.workspace_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(LoadedWorkspace::read(output, session));
+        });
+    }
+    fn open_document(&mut self, path: PathBuf) {
+        if let Some(index) = self.documents.iter().position(|d| d.path == path) {
+            self.active = Some(index);
+            self.tab = 0;
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.document_rx = Some(rx);
+        thread::spawn(move || {
+            let result = (|| {
+                let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+                if metadata.len() > MAX_EDITOR_BYTES {
+                    return Err("file exceeds editor limit".into());
+                }
+                let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                Ok(Document::new(path, text))
+            })();
+            let _ = tx.send(result);
+        });
+    }
     fn poll(&mut self) {
+        if let Some(loaded) = self.workspace_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.workspace_rx = None;
+            self.files = loaded.files;
+            self.documents = loaded.documents;
+            self.active = loaded.active;
+            self.native_reports = loaded.native_reports;
+            self.triage_report = loaded.triage_report;
+            self.session.problems = loaded.session.problems;
+            self.tab = if self.active.is_some() {
+                if self.base_path.is_some() {
+                    self.session.tab.min(3)
+                } else {
+                    0
+                }
+            } else {
+                1
+            };
+        }
+        if let Some(result) = self.document_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.document_rx = None;
+            match result {
+                Ok(doc) => {
+                    self.documents.push(doc);
+                    self.active = Some(self.documents.len() - 1);
+                    self.tab = 0;
+                }
+                Err(error) => self.status = error,
+            }
+        }
+
         let mut events = vec![];
         let mut disconnected = false;
         if let Some(rx) = &self.receiver {
-            loop {
+            for _ in 0..128 {
                 match rx.try_recv() {
                     Ok(event) => events.push(event),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -785,9 +997,13 @@ impl Toker {
                 }
             }
         }
+        let mut log_batch = String::new();
         for event in events {
             match event {
-                Event::Log(text) => self.log(&text),
+                Event::Log(text) => {
+                    log_batch.push_str(&text);
+                    log_batch.push('\n');
+                }
                 Event::Output(path) => {
                     self.attach_log(&path);
                     self.output = Some(path);
@@ -816,8 +1032,8 @@ impl Toker {
                 Event::EndStage(at) => self.clock.finish(at, &mut self.session),
                 Event::Identity(hash) => self.input_hash = hash,
                 Event::Progress(progress) => {
-                    self.log(&format!(
-                        "{} · {} · {} / {} objects",
+                    log_batch.push_str(&format!(
+                        "{} · {} · {} / {} objects\n",
                         progress.file, progress.phase, progress.done, progress.total
                     ));
                     self.session.progress = Some(progress);
@@ -839,11 +1055,13 @@ impl Toker {
                     self.verification = message.clone();
                     self.log(&message);
                     self.load_sources();
-                    self.load_problems();
-                    self.load_native_reports();
+
                     self.persist_session();
                 }
             }
+        }
+        if !log_batch.is_empty() {
+            self.log(&log_batch);
         }
         if disconnected && self.busy {
             self.busy = false;
@@ -977,9 +1195,14 @@ impl Toker {
             doc.line_starts.len(),
             doc.text.len()
         ));
-        if doc.line_starts.len() > 4000 || doc.text.len() > 512 * 1024 {
+        {
             ui.horizontal(|ui| {
-                ui.weak(tr("большой файл"));
+                ui.weak(tr("код"));
+                if doc.max_columns > 8192 {
+                    ui.weak(tr(
+                        "очень длинные строки показаны до 8192 символов в просмотре",
+                    ));
+                }
                 if ui
                     .selectable_label(doc.fast_view, tr("быстрый просмотр"))
                     .clicked()
@@ -1020,7 +1243,13 @@ impl Toker {
                             .line_cache
                             .entry(line)
                             .or_insert_with(|| {
-                                highlight(doc.text[start..end].trim_end_matches(['\r', '\n']))
+                                let line = doc.text[start..end].trim_end_matches(['\r', '\n']);
+                                let cut = line
+                                    .char_indices()
+                                    .nth(8192)
+                                    .map(|(at, _)| at)
+                                    .unwrap_or(line.len());
+                                highlight(&line[..cut])
                             })
                             .clone();
                         ui.horizontal(|ui| {
@@ -1481,6 +1710,7 @@ impl eframe::App for Toker {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         crate::language::set(self.settings.english);
         self.poll();
+        self.updates(ctx);
         self.rename_dialog(ctx);
         if let Some(input) = self.queued_input.take() {
             self.start(input);
@@ -1550,7 +1780,11 @@ impl eframe::App for Toker {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
             self.save(false);
         }
-        if self.busy {
+        if self.busy
+            || self.workspace_rx.is_some()
+            || self.document_rx.is_some()
+            || self.update_rx.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
         egui::TopBottomPanel::top("toolbar")
@@ -1560,6 +1794,10 @@ impl eframe::App for Toker {
                 ui.horizontal_wrapped(|ui| {
                     ui.image((self.avatar.id(), egui::vec2(30.0, 30.0)));
                     ui.heading(RichText::new("UIE").color(Color32::from_rgb(235, 238, 241)));
+                    if ui.add_enabled(!self.settings.offline && self.update_rx.is_none(),egui::Button::new(tr("проверить обновления"))).clicked(){
+                        self.update_checked=true;self.update_rx=Some(crate::updater::start_check());
+                        self.status=tr("проверка обновлений");
+                    }
                     let previous = self.settings.english;
                     egui::ComboBox::from_id_salt("language")
                         .selected_text(if self.settings.english {
@@ -1823,7 +2061,23 @@ impl eframe::App for Toker {
                     egui::ScrollArea::both()
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            ui.monospace(&self.logs);
+                            let lines: Vec<_> = self.logs.lines().collect();
+                            egui::ScrollArea::vertical().id_salt("log-lines").show_rows(
+                                ui,
+                                15.0,
+                                lines.len(),
+                                |ui, range| {
+                                    for row in range {
+                                        let text = lines[row];
+                                        let end = text
+                                            .char_indices()
+                                            .nth(8192)
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(text.len());
+                                        ui.monospace(&text[..end]);
+                                    }
+                                },
+                            );
                         });
                 }
             }
@@ -1841,6 +2095,62 @@ impl Drop for Toker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_flood_is_bounded_and_workspace_loads_in_background() {
+        let context = egui::Context::default();
+        let avatar = context.load_texture(
+            "async-test",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..10_000 {
+            tx.send(Event::Log("test log".into())).unwrap();
+        }
+        app.receiver = Some(rx);
+        app.poll();
+        assert_eq!(app.logs.lines().count(), 128);
+        let root = std::env::temp_dir().join(format!("uie-async-{}", std::process::id()));
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::write(root.join("source/main.py"), "print('ready')").unwrap();
+        app.receiver = None;
+        app.output = Some(root.clone());
+        app.load_sources();
+        assert!(app.workspace_rx.is_some());
+        assert!(app.documents.is_empty());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.workspace_rx.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.active.is_some());
+        assert!(app.documents[0].fast_view);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn minified_source_uses_bounded_visible_layout() {
+        let context = egui::Context::default();
+        let avatar = context.load_texture(
+            "minified-test",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        app.documents.push(Document::new(
+            "minified.js".into(),
+            "counter+=1;".repeat(200_000),
+        ));
+        app.active = Some(0);
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.editor(ui));
+        });
+        assert!(app.documents[0].text.len() > 2_000_000);
+        assert!(app.documents[0]
+            .line_cache
+            .values()
+            .all(|job| job.text.chars().count() <= 8192));
+    }
     #[test]
     fn problem_navigation_and_full_log_do_not_drop_data() {
         let root = std::env::temp_dir().join(format!("uie-navigation-{}", std::process::id()));
@@ -1869,6 +2179,11 @@ mod tests {
             line: 3,
             message: "test mismatch".into(),
         });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while app.document_rx.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(app.tab, 0);
         assert_eq!(app.cursor_line, Some(2));
         assert_eq!(app.scroll_to_line, Some(2));
