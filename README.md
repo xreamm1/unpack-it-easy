@@ -1,12 +1,14 @@
 # Unpack It Easy (UIE)
 
-Windows x64 desktop application for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
+Rust desktop application with a Windows x64 release for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
 
 ## Download and run
 
 Download **UIE.exe** from [Releases](https://github.com/xreamm1/unpack-it-easy/releases). Open or drag a file into the window. Required backends are downloaded automatically into `engines` beside the executable. The initial setup requires internet access and several gigabytes of disk space. Keep `UIE.exe` and `engines` together.
 
-Select **English** or **русский** in the toolbar.
+English is the default for new installations. Select **English** or **русский** in the toolbar.
+
+For Linux builds and native backend setup see [Linux instructions](docs/linux.md). The automatic PowerShell installer and executable updater are Windows-only.
 
 ## Features
 

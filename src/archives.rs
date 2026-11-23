@@ -162,7 +162,7 @@ pub fn prepare_cfr(
         fs::create_dir_all(jar.parent().unwrap()).map_err(|e| e.to_string())?;
         let partial = jar.with_extension("part");
         run_tool(
-            "curl.exe",
+            &crate::engine::find_tool(&[if cfg!(windows) { "curl.exe" } else { "curl" }]),
             &[
                 "--fail".into(),
                 "--location".into(),
@@ -205,11 +205,7 @@ pub fn java(
         events,
     )?;
     let jar = prepare_cfr(output, cancel, events)?;
-    let java = crate::runtime::environment()
-        .into_iter()
-        .find(|(key, _)| key == "JAVA_HOME")
-        .map(|(_, path)| PathBuf::from(path).join("bin/java.exe"))
-        .ok_or("bundled Java missing")?;
+    let java = crate::runtime::java();
     let source = output.join("source");
     // Validate JAR paths before passing the archive to the external decompiler.
     if input

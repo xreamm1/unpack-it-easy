@@ -22,7 +22,7 @@ pub const MAX_LOG_CHUNK: u64 = 64 * 1024;
 pub const MAX_COLLECTED_FILES: usize = 100_000;
 pub const FUNCTION_TIMEOUT_SECONDS: usize = 60;
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub diec: String,
@@ -37,6 +37,24 @@ pub struct Settings {
     pub english: bool,
     pub offline: bool,
     pub hide_updates: bool,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            diec: String::new(),
+            extractor: String::new(),
+            pylingual: String::new(),
+            ilspy: String::new(),
+            ghidra: String::new(),
+            output: String::new(),
+            all_modules: false,
+            python: String::new(),
+            force_rebuild: false,
+            english: true,
+            offline: false,
+            hide_updates: false,
+        }
+    }
 }
 
 pub enum Event {
@@ -62,6 +80,8 @@ impl Event {
 pub fn config_path() -> PathBuf {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .unwrap_or_else(env::temp_dir)
         .join("UnpackItEasy")
         .join("settings.json")
@@ -93,7 +113,7 @@ pub fn find_tool(names: &[&str]) -> String {
     if let Some(path) = env::var_os("PATH") {
         folders.extend(env::split_paths(&path));
     }
-    if let Some(profile) = env::var_os("USERPROFILE") {
+    if let Some(profile) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
         folders.push(PathBuf::from(&profile).join(".local/bin"));
         folders.push(PathBuf::from(profile).join(".dotnet/tools"));
     }
@@ -266,7 +286,11 @@ pub fn run_tool(
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
     {
-        let mut command = Command::new(crate::runtime::root().join("dotnet/dotnet.exe"));
+        let mut command = Command::new(if cfg!(windows) {
+            crate::runtime::root().join("dotnet/dotnet.exe")
+        } else {
+            PathBuf::from(find_tool(&["dotnet"]))
+        });
         command.arg(&tool);
         command
     } else {

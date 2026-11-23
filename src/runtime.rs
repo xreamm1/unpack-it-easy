@@ -117,6 +117,28 @@ pub fn environment() -> Vec<(String, OsString)> {
     vars
 }
 
+pub fn java() -> PathBuf {
+    environment()
+        .into_iter()
+        .find(|(key, _)| key == "JAVA_HOME")
+        .map(|(_, path)| PathBuf::from(path))
+        .or_else(|| env::var_os("JAVA_HOME").map(PathBuf::from))
+        .map(|home| {
+            home.join(if cfg!(windows) {
+                "bin/java.exe"
+            } else {
+                "bin/java"
+            })
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(crate::engine::find_tool(&[if cfg!(windows) {
+                "java.exe"
+            } else {
+                "java"
+            }]))
+        })
+}
+
 pub fn prepare(
     settings: &mut Settings,
     route: &Route,
@@ -133,12 +155,10 @@ pub fn prepare(
             Route::PythonBytecode => exists(&settings.pylingual),
             Route::DotNet => exists(&settings.ilspy),
             Route::Native => exists(&settings.ghidra),
-            Route::Java => environment().into_iter().any(|(key, path)| {
-                key == "JAVA_HOME" && PathBuf::from(path).join("bin/java.exe").is_file()
-            }),
+            Route::Java => java().is_file(),
             Route::Asar | Route::Unknown => true,
         };
-    if backend_ready && exists(&settings.diec) {
+    if backend_ready && (exists(&settings.diec) || !cfg!(windows)) {
         return Ok(());
     }
     if settings.offline || is_offline() {
@@ -146,6 +166,9 @@ pub fn prepare(
             "offline mode: required engines are missing; prepare the offline bundle while online"
                 .into(),
         );
+    }
+    if !cfg!(windows) {
+        return Err("Missing analysis backend. On Linux install native dependencies and configure engines/engines.json; see docs/linux.md. The Windows PowerShell installer is not used.".into());
     }
     let root = root();
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
