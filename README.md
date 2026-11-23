@@ -1,5 +1,6 @@
-Unpack It Easy (UIE) <img width="1919" height="1009" alt="изображение" src="https://github.com/user-attachments/assets/ab2e61c9-d808-4264-977a-cfcb6eb99546" />
+# Unpack It Easy (UIE)
 
+![UIE Interface](https://github.com/user-attachments/assets/ab2e61c9-d808-4264-977a-cfcb6eb99546)
 
 Windows x64 desktop application for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
 
