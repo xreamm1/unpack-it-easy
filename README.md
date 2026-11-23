@@ -1,13 +1,10 @@
 # Unpack It Easy (UIE)
-# Unpack It Easy (UIE)
-
-[![GitHub Release](https://shields.io)](https://github.com)
-[![GitHub Stars](https://shields.io)](https://github.com)
-[![Downloads](https://shields.io)](https://github.com)
-[![License](https://shields.io)](https://github.com)
-![Rust](https://shields.io)
-![Platform](https://shields.io)
-
+[![GitHub Release](https://img.shields.io/github/v/release/xreamm1/unpack-it-easy?style=flat-square&logo=github)](https://github.com/xreamm1/unpack-it-easy/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/xreamm1/unpack-it-easy?style=flat-square&logo=github)](https://github.com/xreamm1/unpack-it-easy/stargazers)
+[![GitHub Downloads](https://img.shields.io/github/downloads/xreamm1/unpack-it-easy/total?style=flat-square&logo=github)](https://github.com/xreamm1/unpack-it-easy/releases)
+[![License](https://img.shields.io/github/license/xreamm1/unpack-it-easy?style=flat-square)](https://github.com/xreamm1/unpack-it-easy/blob/main/LICENSE)
+![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows%20x64-blue?style=flat-square)
 ![UIE Interface](https://github.com/user-attachments/assets/ab2e61c9-d808-4264-977a-cfcb6eb99546)
 
 Windows x64 desktop application for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
