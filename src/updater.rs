@@ -128,6 +128,9 @@ fn curl(url: &str, path: &Path, limit: u64, timeout: u64) -> Result<(), String> 
     }
 }
 pub fn check() -> Result<Option<Release>, String> {
+    if !cfg!(windows) {
+        return Ok(None);
+    }
     let folder = std::env::temp_dir().join(format!("uie-check-{}", std::process::id()));
     fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
     let file = folder.join("latest.json");

@@ -1,24 +1,14 @@
 # Unpack It Easy (UIE)
-<div align="center">
 
-[![GitHub Release](https://img.shields.io/github/v/release/xreamm1/unpack-it-easy?style=for-the-badge&logo=github&color=orange)](https://github.com/xreamm1/unpack-it-easy/releases)
-[![GitHub Stars](https://img.shields.io/github/stars/xreamm1/unpack-it-easy?style=for-the-badge&logo=github&color=blue)](https://github.com/xreamm1/unpack-it-easy/stargazers)
-[![GitHub Downloads](https://img.shields.io/github/downloads/xreamm1/unpack-it-easy/total?style=for-the-badge&logo=github&color=olive)](https://github.com/xreamm1/unpack-it-easy/releases)
-[![License](https://img.shields.io/github/license/xreamm1/unpack-it-easy?style=for-the-badge&color=green)](https://github.com/xreamm1/unpack-it-easy/blob/main/LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows_x64-blue?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy)
-[![Build](https://img.shields.io/badge/BUILD-PASSING-brightgreen?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy/actions)
-
-</div>
-<img width="1919" height="1009" alt="изображение" src="https://github.com/user-attachments/assets/a47c2d50-c25d-4342-b53b-bf4de0d5f199" />
-
-Windows x64 desktop application for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
+Rust desktop application with a Windows x64 release for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
 
 ## Download and run
 
 Download **UIE.exe** from [Releases](https://github.com/xreamm1/unpack-it-easy/releases). Open or drag a file into the window. Required backends are downloaded automatically into `engines` beside the executable. The initial setup requires internet access and several gigabytes of disk space. Keep `UIE.exe` and `engines` together.
 
-Select **English** or **русский** in the toolbar.
+English is the default for new installations. Select **English** or **русский** in the toolbar.
+
+For Linux builds and native backend setup see [Linux instructions](docs/linux.md). The automatic PowerShell installer and executable updater are Windows-only.
 
 ## Features
 
