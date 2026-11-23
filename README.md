@@ -10,6 +10,8 @@
 [![Build](https://img.shields.io/badge/BUILD-PASSING-brightgreen?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy/actions)
 
 </div>
+<img width="1919" height="1009" alt="изображение" src="https://github.com/user-attachments/assets/a47c2d50-c25d-4342-b53b-bf4de0d5f199" />
+
 Windows x64 desktop application for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
 
 ## Download and run
