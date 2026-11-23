@@ -1,4 +1,12 @@
 # Unpack It Easy (UIE)
+# Unpack It Easy (UIE)
+
+[![GitHub Release](https://shields.io)](https://github.com)
+[![GitHub Stars](https://shields.io)](https://github.com)
+[![Downloads](https://shields.io)](https://github.com)
+[![License](https://shields.io)](https://github.com)
+![Rust](https://shields.io)
+![Platform](https://shields.io)
 
 ![UIE Interface](https://github.com/user-attachments/assets/ab2e61c9-d808-4264-977a-cfcb6eb99546)
 
