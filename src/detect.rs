@@ -224,6 +224,10 @@ pub fn inspect(data: &[u8]) -> Result<Analysis, String> {
         result.route = Route::PythonBytecode;
     }
     for (signature, label) in [
+        (
+            b"__pyx_".as_slice(),
+            "cython: generated extension marker (heuristic)",
+        ),
         (b"Nuitka".as_slice(), "nuitka: runtime marker (heuristic)"),
         (
             b"rust_eh_personality".as_slice(),

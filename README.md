@@ -44,6 +44,29 @@ An accepted update is downloaded in the background and checked against the relea
 
 Result discovery, source reading and symbol indexing run in background workers. Event processing is limited per frame and log writes are batched. Files initially use virtualized viewing; select edit to modify the source. Very long lines show their first 8192 characters in viewing mode; complete source is retained on disk and in project databases.
 
+## Native Python builds and debugger
+
+Nuitka and Cython compile Python to native code. UIE routes these files to Ghidra, not to a Python-bytecode decompiler. Output is C pseudocode and supporting evidence; original Python reconstruction is not guaranteed.
+
+- User/module initializers and Python-related string XREF candidates are prioritized.
+- Failed functions get a conservative retry and then an explicitly marked disassembly fallback.
+- Entropy, constants initialization and data XREF reports help locate candidate processing sites. They do not automatically decrypt Nuitka Commercial constants.
+- Hybrid launcher builds containing `app/*.pyd` prioritize application modules and exclude the separate `runtime` dependency tree from automatic decompilation. The discovery report records this exclusion.
+- The Windows **x64dbg / x32dbg** toolbar button downloads a pinned official snapshot with a SHA-256 check. Select an empty debugger or explicitly start the selected PE executable under the debugger. This is a separate action that starts a target process; static analysis does not launch targets. ARM64 and non-PE debugging are unsupported by this integration.
+- Offline bundle preparation includes x64dbg on Windows. Linux uses native analysis backends and does not offer the Windows debugger integration.
+
+The known-source test in `tests/fixtures/nuitka_sample.py` was compiled with Nuitka 4.3.5 / CPython 3.12 and analyzed: 488 functions emitted, no decompilation failures. This validates the native analysis route, not Python source equivalence. A supplied hybrid application showed Cython markers in its extension modules; it is not evidence of Nuitka Commercial support.
+
+## About and donations
+
+The About dialog shows author information, version, repository and the purpose of donations: UIE development, new formats and bug fixes. BTC, LTC, USDT on TRC20, TON and TRX addresses are embedded in `assets/donations.json`; the selected address has a QR code and copy button. No payment is submitted by the application. XMR is not listed.
+
+## Offline preparation and diagnostics
+
+Each preparation attempt gets a fresh directory under `engines/offline-preparation`, so existing log files no longer break retries. Downloads retry transient failures and record successful Python versions individually. Errors launching the GUI are recorded in `startup-error.log` beside the settings file, including on Windows without a visible console. A reported startup failure on a customized Windows VM has not been reproduced.
+
+UIE's own log messages and reports are translated for display and log export. Raw per-backend log files retain original diagnostic text; arbitrary output from external tools and operating systems may remain in its original language.
+
 ## Offline mode
 
 While online, select a Python version or **all python versions**, then click **download offline bundle**. This prepares DIE, Python/PyLingual, Ghidra/Java, ILSpy and CFR, plus the selected Python interpreters and model snapshots under `engines`. The all-versions option prepares Python **3.8–3.14** and requires multiple gigabytes. Preparation can be cancelled and rerun; successful version preparations are recorded in `engines/offline-ready.json`.

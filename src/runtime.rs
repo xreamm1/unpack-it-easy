@@ -205,13 +205,31 @@ pub fn prepare(
         &powershell.to_string_lossy(),
         &args,
         output,
-        &output.join("prepare-engines.log"),
+        &output.join(format!("prepare-{install_route}.log")),
         TOOL_TIMEOUT_SECONDS,
         cancel,
         events,
     )?;
     discover(settings);
     Ok(())
+}
+
+fn offline_output(root: &Path) -> Result<PathBuf, String> {
+    let parent = root.join("offline-preparation");
+    fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    for suffix in 0..100 {
+        let output = parent.join(format!("run-{stamp}-{suffix}"));
+        match fs::create_dir(&output) {
+            Ok(()) => return Ok(output),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("could not allocate offline preparation directory".into())
 }
 
 pub fn prepare_offline(
@@ -228,7 +246,7 @@ pub fn prepare_offline(
         {
             return Err("unsupported offline Python version".into());
         }
-        let output = root().join("offline-preparation");
+        let output = offline_output(&root())?;
         fs::create_dir_all(&output).map_err(|e| e.to_string())?;
         for route in [
             Route::PythonArchive,
@@ -239,6 +257,9 @@ pub fn prepare_offline(
             prepare(&mut settings, &route, true, &output, &cancel, &events)?;
         }
         crate::archives::prepare_cfr(&output, &cancel, &events)?;
+        if cfg!(windows) {
+            crate::debugger::prepare("x64", false)?;
+        }
         let script = output.join("prepare_offline.py");
         fs::write(&script, include_str!("prepare_offline.py")).map_err(|e| e.to_string())?;
         run_tool(
@@ -264,6 +285,17 @@ pub fn prepare_offline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_offline_preparation_has_fresh_log_paths() {
+        let root = std::env::temp_dir().join(format!("uie-offline-retry-{}", std::process::id()));
+        let a = offline_output(&root).unwrap();
+        let b = offline_output(&root).unwrap();
+        assert_ne!(a, b);
+        fs::write(a.join("models.log"), "old").unwrap();
+        assert!(!b.join("models.log").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn offline_missing_engines_never_start_installer() {
         let mut settings = Settings {

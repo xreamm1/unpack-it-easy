@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod about;
 mod archives;
 mod database;
+mod debugger;
 mod detect;
 mod engine;
 mod indicators;
@@ -85,7 +87,18 @@ fn headless(args: &[std::ffi::OsString]) -> i32 {
 }
 
 fn main() -> eframe::Result<()> {
+    std::panic::set_hook(Box::new(|info| {
+        let path = engine::config_path().with_file_name("startup-error.log");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, info.to_string());
+    }));
     let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--prepare-debugger") {
+        let result = debugger::prepare("x64", Settings::load().offline);
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if args.get(1).is_some_and(|a| a == "--prepare-offline") {
         let versions = args
             .get(2)
@@ -172,17 +185,31 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 640.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Unpack It Easy (UIE)",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            cc.egui_ctx.style_mut(|style| style.animation_time = 0.0);
             let avatar = cc.egui_ctx.load_texture(
                 "uie-avatar",
                 avatar,
                 eframe::egui::TextureOptions::LINEAR,
             );
-            Ok(Box::new(ui::Toker::new(input, avatar)))
+            let mut app = ui::Toker::new(input, avatar);
+            if args.iter().any(|arg| arg == "--about") {
+                app.show_about();
+            }
+            Ok(Box::new(app))
         }),
-    )
+    );
+    if let Err(error) = &result {
+        let path = engine::config_path().with_file_name("startup-error.log");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, error.to_string());
+        eprintln!("UIE startup failed: {error}");
+    }
+    result
 }

@@ -113,6 +113,13 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
         stem.clone(),
         format!("{stem}.dist"),
     ];
+    let application_modules = fs::read_dir(root.join("app")).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("pyd"))
+        })
+    });
     let mut queue = vec![(root.to_path_buf(), 0usize)];
     let mut visited = HashSet::new();
     let mut entries = 0;
@@ -148,6 +155,14 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
             }
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             if kind.is_dir() {
+                if depth == 0 && name == "runtime" && application_modules {
+                    plan.skipped.push("runtime: dependency tree excluded because app contains native user modules".into());
+                    continue;
+                }
+                if ["assets", "models", "__pycache__"].contains(&name.as_str()) {
+                    continue;
+                }
+
                 if depth < MAX_DEPTH
                     && !name.starts_with('.')
                     && (depth > 0
@@ -230,12 +245,47 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
         }
     }
     plan.modules.sort_by(|a, b| a.relative.cmp(&b.relative));
+    plan.modules.sort_by_key(|module| {
+        let path = module.relative.to_string_lossy().to_ascii_lowercase();
+        (
+            if path.starts_with("app") && path.ends_with(".pyd") {
+                0
+            } else if path.ends_with(".pyd") {
+                1
+            } else if path.ends_with(".py") {
+                2
+            } else {
+                3
+            },
+            path,
+        )
+    });
     Ok(plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hybrid_app_modules_take_priority_over_runtime_tree() {
+        let root = std::env::temp_dir().join(format!("uie-hybrid-{}", std::process::id()));
+        fs::create_dir_all(root.join("app/core")).unwrap();
+        fs::create_dir_all(root.join("runtime")).unwrap();
+        let mut elf = vec![0u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        fs::write(root.join("app/main.pyd"), &elf).unwrap();
+        fs::write(root.join("app/core/worker.pyd"), &elf).unwrap();
+        fs::write(root.join("runtime/tcl.dll"), &elf).unwrap();
+        elf.extend_from_slice(b"runtime\\ app\\");
+        let input = root.join("launcher.exe");
+        fs::write(&input, &elf).unwrap();
+        let plan = discover(&input, &inspect_file(&input).unwrap()).unwrap();
+        assert_eq!(plan.modules.len(), 2);
+        assert!(plan.modules.iter().all(|m| m.relative.starts_with("app")));
+        assert!(plan.skipped.iter().any(|s| s.starts_with("runtime:")));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn path_markers_and_runtime_filter() {
         let wide: Vec<_> = "runtime\\core.pyd"

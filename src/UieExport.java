@@ -113,6 +113,19 @@ public class UieExport extends GhidraScript {
             else queue.add(function);
         }
         queue.sort(Comparator.comparingInt((Function f)->priority(f,candidates)).thenComparing(Function::getEntryPoint));
+        List<Map<String,Object>> pythonStrings=new ArrayList<>();
+        DataIterator defined=currentProgram.getListing().getDefinedData(true);
+        while(defined.hasNext()&&pythonStrings.size()<1024&&!monitor.isCancelled()){
+            Data data=defined.next();Object value=data.getValue();if(!(value instanceof String))continue;
+            String text=(String)value;
+            if(text.length()>512||!(text.contains("Nuitka")||text.contains("__pyx_")||text.endsWith(".py")||text.contains("__main__")||text.startsWith("modulecode_")||text.startsWith("impl_")))continue;
+            List<Map<String,Object>> incoming=new ArrayList<>();ReferenceIterator refsTo=refs.getReferencesTo(data.getAddress());
+            while(refsTo.hasNext()&&incoming.size()<64){Reference reference=refsTo.next();Function function=getFunctionContaining(reference.getFromAddress());
+                if(function!=null){candidates.add(function.getEntryPoint());incoming.add(row("function",function.getSymbol().getName(true),"address",function.getEntryPoint().toString(),"rva",rva(function.getEntryPoint()),"from",reference.getFromAddress().toString()));}
+            }
+            pythonStrings.add(row("value",text,"address",data.getAddress().toString(),"rva",rva(data.getAddress()),"references",incoming));
+        }
+        queue.sort(Comparator.comparingInt((Function f)->priority(f,candidates)).thenComparing(Function::getEntryPoint));
         DecompInterface decompiler=new DecompInterface();
         List<Map<String,Object>> functions=new ArrayList<>(); List<Map<String,Object>> initializers=new ArrayList<>();
         int success=0,failed=0,processed=0;
@@ -127,6 +140,14 @@ public class UieExport extends GhidraScript {
                 write("\n/* Function at "+function.getEntryPoint()+": "+name.replace("*/","* /")+" */\n");
                 DecompileResults result=decompiler.decompileFunction(function,TIMEOUT,monitor);
                 boolean good=result.decompileCompleted()&&result.getDecompiledFunction()!=null;
+                boolean retried=false;
+                if(!good&&!monitor.isCancelled()){
+                    retried=true;DecompileOptions conservative=new DecompileOptions();conservative.setEliminateUnreachable(false);conservative.setRespectReadOnly(false);conservative.setPredicate(false);
+                    decompiler.setOptions(conservative);decompiler.flushCache();
+                    DecompileResults retry=decompiler.decompileFunction(function,TIMEOUT,monitor);
+                    if(retry.decompileCompleted()&&retry.getDecompiledFunction()!=null){result=retry;good=true;}
+                    decompiler.setOptions(new DecompileOptions());decompiler.flushCache();
+                }
                 if (good) { write(result.getDecompiledFunction().getC()); success++; }
                 else {
                     write("/* decompilation failed: "+result.getErrorMessage().replace("*/","* /")+"\n");
@@ -138,7 +159,7 @@ public class UieExport extends GhidraScript {
                     write("*/\n"); failed++;
                     println("UIE_EVENT "+json.toJson(row("kind","problem","file",source,"symbol",name,"line",firstLine,"message",result.getErrorMessage())));
                 }
-                Map<String,Object> record=row("name",name,"address",function.getEntryPoint().toString(),"rva",rva(function.getEntryPoint()),"line",firstLine,"group",user(function)?"user":initializer(function)?"constants":"other","success",good,"error",good?"":result.getErrorMessage(),"fallback",good?"":"disassembly");
+                Map<String,Object> record=row("name",name,"address",function.getEntryPoint().toString(),"rva",rva(function.getEntryPoint()),"line",firstLine,"group",user(function)?"user":initializer(function)?"constants":"other","success",good,"retried",retried,"error",good?"":result.getErrorMessage(),"fallback",good?"":"disassembly");
                 functions.add(record);
                 if (initializer(function)) {
                     List<Map<String,Object>> callers=new ArrayList<>(); ReferenceIterator incoming=refs.getReferencesTo(function.getEntryPoint());
@@ -149,7 +170,7 @@ public class UieExport extends GhidraScript {
                 println("UIE_EVENT "+json.toJson(row("kind","progress","phase","декомпиляция функций","file",source,"done",processed,"total",queue.size())));
             }
         } finally { decompiler.dispose(); }
-        Map<String,Object> report=row("source_file",output.getFileName().toString(),"decompiled",success,"failed",failed,"filtered_runtime",skipped.size(),"skipped_functions",skipped,"functions",functions,"constant_initializers",initializers,"sections",sections,"high_entropy_sections",highEntropy,"constant_data_xrefs",references,"xrefs_truncated",limited,"entropy_threshold",ENTROPY_THRESHOLD,"interpretation","Entropy and XREFs identify candidate constant/data-processing sites. Nuitka Commercial and encryption are not proven by entropy alone.");
+        Map<String,Object> report=row("source_file",output.getFileName().toString(),"decompiled",success,"failed",failed,"filtered_runtime",skipped.size(),"skipped_functions",skipped,"functions",functions,"constant_initializers",initializers,"sections",sections,"high_entropy_sections",highEntropy,"constant_data_xrefs",references,"python_string_references",pythonStrings,"xrefs_truncated",limited,"entropy_threshold",ENTROPY_THRESHOLD,"interpretation","Entropy and XREFs identify candidate constant/data-processing sites. Nuitka Commercial and encryption are not proven by entropy alone.");
         Files.write(output.resolveSibling("native-report.json"),new GsonBuilder().setPrettyPrinting().create().toJson(report).getBytes(StandardCharsets.UTF_8));
         println("UIE native result: "+success+" functions, "+failed+" failures, "+skipped.size()+" runtime functions filtered");
     }

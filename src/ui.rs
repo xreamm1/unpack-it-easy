@@ -367,6 +367,10 @@ impl LoadedWorkspace {
 }
 
 pub struct Toker {
+    about: crate::about::About,
+    debugger_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    debugger_ready: Option<PathBuf>,
+    debugger_prompt: bool,
     settings: Settings,
     input: Option<PathBuf>,
     analysis: Option<Analysis>,
@@ -417,6 +421,51 @@ pub struct Toker {
 }
 
 impl Toker {
+    fn debugger_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.debugger_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.debugger_rx = None;
+            match result {
+                Ok(exe) => {
+                    self.debugger_ready = Some(exe);
+                    self.debugger_prompt = true;
+                }
+                Err(error) => self.status = error,
+            }
+        }
+        if !self.debugger_prompt {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("x64dbg / x32dbg")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(tr("открытие образца в отладчике запускает его процесс"));
+                if let Some(exe) = &self.debugger_ready {
+                    if ui.button(tr("открыть пустой отладчик")).clicked() {
+                        if let Err(error) = crate::debugger::launch(exe, None) {
+                            self.status = error;
+                        }
+                        self.debugger_prompt = false;
+                    }
+                    if let Some(input) = &self.input {
+                        if input
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                            && self.analysis.as_ref().is_some_and(|a| a.format == "PE")
+                            && ui.button(tr("запустить образец под отладчиком")).clicked()
+                        {
+                            if let Err(error) = crate::debugger::launch(exe, Some(input)) {
+                                self.status = error;
+                            }
+                            self.debugger_prompt = false;
+                        }
+                    }
+                }
+            });
+        self.debugger_prompt &= open;
+    }
     fn apply_update(&mut self, ctx: &egui::Context) {
         if self.busy {
             return;
@@ -438,6 +487,9 @@ impl Toker {
             }
             Err(error) => self.status = error,
         }
+    }
+    pub fn show_about(&mut self) {
+        self.about.open = true;
     }
     fn updates(&mut self, ctx: &egui::Context) {
         if !self.update_checked && !self.settings.hide_updates && !self.settings.offline {
@@ -519,6 +571,10 @@ impl Toker {
         let settings = Settings::load();
         crate::language::set(settings.english);
         let mut app = Self {
+            about: crate::about::About::default(),
+            debugger_rx: None,
+            debugger_ready: None,
+            debugger_prompt: false,
             settings,
             input: None,
             analysis: None,
@@ -732,6 +788,16 @@ impl Toker {
                         }
                     }
                 });
+                if let Some(strings)=native.report["python_string_references"].as_array(){
+                    egui::CollapsingHeader::new(format!("Python / Nuitka / Cython strings ({})",strings.len())).id_salt((&native.file,"python-strings")).show(ui,|ui|{
+                        egui::ScrollArea::vertical().max_height(220.0).show_rows(ui,20.0,strings.len(),|ui,range|{for index in range{
+                            let string=&strings[index];ui.label(format!("{} · {}",string["rva"].as_str().unwrap_or("?"),string["value"].as_str().unwrap_or("?")));
+                            for reference in string["references"].as_array().into_iter().flatten(){let name=reference["function"].as_str().unwrap_or("?");
+                                if ui.link(name).clicked(){selected=Some(Problem{file:native.file.clone(),symbol:name.into(),line:*native.lines.get(name).unwrap_or(&1),message:"Python string XREF candidate".into()});}
+                            }
+                        }});
+                    });
+                }
                 if let Some(xrefs)=native.report["constant_data_xrefs"].as_array() {
                     egui::CollapsingHeader::new(tr(&format!("XREF к данным: {}",xrefs.len()))).id_salt((&native.file,"xrefs")).show(ui,|ui| {
                         egui::ScrollArea::vertical().max_height(240.0).id_salt((&native.file,"xref-rows")).show_rows(ui,20.0,xrefs.len(),|ui,rows| {
@@ -1035,7 +1101,10 @@ impl Toker {
                 Event::Progress(progress) => {
                     log_batch.push_str(&format!(
                         "{} · {} · {} / {} objects\n",
-                        progress.file, progress.phase, progress.done, progress.total
+                        progress.file,
+                        tr(&progress.phase),
+                        progress.done,
+                        progress.total
                     ));
                     self.session.progress = Some(progress);
                 }
@@ -1104,18 +1173,18 @@ impl Toker {
         if let Some(a) = &self.analysis {
             ui.label(format!("{} / {}", a.format, a.architecture));
             for hint in a.compiler_hints.iter().chain(&a.packer_hints) {
-                ui.label(hint);
+                ui.label(tr(hint));
             }
             if let Some(die) = &a.detect_it_easy {
                 for line in crate::detect::die_summary(die) {
-                    ui.label(line);
+                    ui.label(tr(&line));
                 }
             }
         }
         ui.separator();
         ui.label(tr(&self.status));
         if let Some(progress) = &self.session.progress {
-            ui.label(format!("{} · {}", progress.file, progress.phase));
+            ui.label(format!("{} · {}", progress.file, tr(&progress.phase)));
             if progress.total > 0 {
                 ui.add(
                     egui::ProgressBar::new(
@@ -1440,7 +1509,7 @@ impl Toker {
                             }
                         });
                     for note in &report.notes {
-                        ui.weak(note);
+                        ui.weak(tr(note));
                     }
                 }
             });
@@ -1721,6 +1790,7 @@ impl eframe::App for Toker {
         crate::language::set(self.settings.english);
         self.poll();
         self.updates(ctx);
+        self.debugger_dialog(ctx);
         self.rename_dialog(ctx);
         if let Some(input) = self.queued_input.take() {
             self.start(input);
@@ -1789,6 +1859,7 @@ impl eframe::App for Toker {
         if self.busy
             || self.workspace_rx.is_some()
             || self.document_rx.is_some()
+            || self.debugger_rx.is_some()
             || self.update_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -1803,6 +1874,11 @@ impl eframe::App for Toker {
                     if ui.add_enabled(!self.settings.offline && self.update_rx.is_none(),egui::Button::new(tr("проверить обновления"))).clicked(){
                         self.update_checked=true;self.update_rx=Some(crate::updater::start_check());
                         self.status=tr("проверка обновлений");
+                    }
+                    if ui.button(tr("о программе")).clicked(){self.about.open=true;}
+                    if cfg!(windows) && ui.add_enabled(!self.busy&&self.debugger_rx.is_none(),egui::Button::new("x64dbg / x32dbg")).clicked(){
+                        let architecture=self.analysis.as_ref().map(|a|a.architecture.clone()).unwrap_or_else(||"x64".into());let offline=self.settings.offline;
+                        let(tx,rx)=mpsc::channel();self.debugger_rx=Some(rx);self.status=tr("подготовка отладчика");thread::spawn(move||{let _=tx.send(crate::debugger::prepare(&architecture,offline));});
                     }
                     let previous = self.settings.english;
                     egui::ComboBox::from_id_salt("language")
@@ -2035,7 +2111,7 @@ impl eframe::App for Toker {
                     self.indicator_panel(ui);
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         if let Some(a) = &self.analysis {
-                            ui.monospace(serde_json::to_string_pretty(a).unwrap_or_default());
+                            ui.monospace(tr(&serde_json::to_string_pretty(a).unwrap_or_default()));
                         } else {
                             ui.label(tr("отчёт появится после анализа"));
                         }
@@ -2049,7 +2125,7 @@ impl eframe::App for Toker {
                                 .set_file_name("uie.log")
                                 .save_file()
                             {
-                                match fs::write(&path, self.full_log()) {
+                                match fs::write(&path, tr(&self.full_log())) {
                                     Ok(()) => {
                                         self.status =
                                             tr(&format!("лог сохранён: {}", path.display()))
@@ -2059,7 +2135,7 @@ impl eframe::App for Toker {
                             }
                         }
                         if ui.button(tr("скопировать лог")).clicked() {
-                            ui.ctx().copy_text(self.full_log());
+                            ui.ctx().copy_text(tr(&self.full_log()));
                             self.status = tr("лог скопирован");
                         }
                     });
@@ -2080,7 +2156,7 @@ impl eframe::App for Toker {
                                             .nth(8192)
                                             .map(|(i, _)| i)
                                             .unwrap_or(text.len());
-                                        ui.monospace(&text[..end]);
+                                        ui.monospace(tr(&text[..end]));
                                     }
                                 },
                             );
@@ -2088,6 +2164,7 @@ impl eframe::App for Toker {
                 }
             }
         });
+        self.about.show(ctx);
     }
 }
 impl Drop for Toker {

@@ -13,3 +13,5 @@ UIE orchestrates separate backends. Their code and models retain their own licen
 - [Eclipse Temurin](https://adoptium.net/)
 
 Rust dependency versions are recorded in Cargo.lock. Consult each dependency's package metadata for its license.
+
+- [x64dbg](https://github.com/x64dbg/x64dbg), GPL-3.0; official snapshot downloaded separately with its distribution files. Source: https://github.com/x64dbg/x64dbg/tree/2026.05.27

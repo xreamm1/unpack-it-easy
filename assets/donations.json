@@ -1,0 +1,27 @@
+[
+  {
+    "coin": "BTC",
+    "network": "Bitcoin",
+    "address": "bc1q6p0ngklpesdjas8qk4x4xdus70e3urx3e033n2"
+  },
+  {
+    "coin": "LTC",
+    "network": "Litecoin",
+    "address": "ltc1qpk9dcx5yn94yd0g5tzpe9d7xwfaspcdhvufxqt"
+  },
+  {
+    "coin": "USDT",
+    "network": "TRC20 \u00b7 Tron",
+    "address": "TUJqCcJBDSrHNBrPcNpsqnwM1e5Asg8M48"
+  },
+  {
+    "coin": "TON",
+    "network": "The Open Network",
+    "address": "UQD-BorWNfj8peilo7DlmbKcjYMPf72KoqpB52dKGnAjkCl6"
+  },
+  {
+    "coin": "TRX",
+    "network": "Tron",
+    "address": "TUJqCcJBDSrHNBrPcNpsqnwM1e5Asg8M48"
+  }
+]

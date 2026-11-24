@@ -322,6 +322,20 @@ pub fn run_tool(
     }
     command.envs(crate::runtime::environment());
     command.env("HF_HUB_DOWNLOAD_TIMEOUT", "600");
+    if args.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "prepare_offline.py")
+    }) {
+        for key in [
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "HF_DATASETS_OFFLINE",
+            "UV_OFFLINE",
+        ] {
+            command.env_remove(key);
+        }
+    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("{}: {e}", tool.display()))?;
@@ -1035,7 +1049,7 @@ pub fn job(
             if let Err(error) = &result {
                 errors.push(format!("{}: {error}", module.relative.display()));
             }
-            module_results.push(serde_json::json!({"module":module,"output":relative,"success":result.is_ok(),"error":result.err()}));
+            module_results.push(serde_json::json!({"module":module,"output":relative,"success":result.is_ok(),"provenance":if module.route=="source"{"copied existing source"}else{"decompiler output"},"error":result.err()}));
         }
         write_json(
             &output.join("triage-report.json"),
