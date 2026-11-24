@@ -1,107 +1,104 @@
-# Unpack It Easy (UIE)
 <div align="center">
 
-[![GitHub Release](https://img.shields.io/github/v/release/xreamm1/unpack-it-easy?style=for-the-badge&logo=github&color=orange)](https://github.com/xreamm1/unpack-it-easy/releases)
-[![GitHub Stars](https://img.shields.io/github/stars/xreamm1/unpack-it-easy?style=for-the-badge&logo=github&color=blue)](https://github.com/xreamm1/unpack-it-easy/stargazers)
-[![GitHub Downloads](https://img.shields.io/github/downloads/xreamm1/unpack-it-easy/total?style=for-the-badge&logo=github&color=olive)](https://github.com/xreamm1/unpack-it-easy/releases)
-[![License](https://img.shields.io/github/license/xreamm1/unpack-it-easy?style=for-the-badge&color=green)](https://github.com/xreamm1/unpack-it-easy/blob/main/LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows_x64-blue?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy)
-[![Build](https://img.shields.io/badge/BUILD-PASSING-brightgreen?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy/actions)
+<img src="assets/uie.png" alt="Unpack It Easy icon" width="80" height="80">
+
+# Unpack It Easy
+
+### Open a binary. Follow the analysis. Explore the code.
+
+A desktop workspace for binary analysis, unpacking and decompilation, written in Rust.
+
+[![Download UIE for Windows x64](https://img.shields.io/badge/Download-UIE.exe-2ea44f?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy/releases/latest/download/UIE.exe)
+[![Latest release](https://img.shields.io/github/v/release/xreamm1/unpack-it-easy?style=for-the-badge&label=latest)](https://github.com/xreamm1/unpack-it-easy/releases/latest)
+
+[![Build status](https://img.shields.io/github/actions/workflow/status/xreamm1/unpack-it-easy/build.yml?branch=main&style=flat-square&label=build)](https://github.com/xreamm1/unpack-it-easy/actions/workflows/build.yml)
+[![Release asset downloads](https://img.shields.io/github/downloads/xreamm1/unpack-it-easy/total?style=flat-square&label=release%20downloads)](https://github.com/xreamm1/unpack-it-easy/releases)
+[![GitHub stars](https://img.shields.io/github/stars/xreamm1/unpack-it-easy?style=flat-square&label=stars)](https://github.com/xreamm1/unpack-it-easy/stargazers)
+[![MIT license](https://img.shields.io/github/license/xreamm1/unpack-it-easy?style=flat-square)](LICENSE)
+
+[Quick start](#quick-start) · [Supported formats](#what-can-i-open) · [Linux setup](docs/linux.md) · [Report a bug](https://github.com/xreamm1/unpack-it-easy/issues/new)
 
 </div>
-<img width="1919" height="1009" alt="изображение" src="https://github.com/user-attachments/assets/a47c2d50-c25d-4342-b53b-bf4de0d5f199" />
 
-Rust desktop application with a Windows x64 release for static binary triage, source extraction and decompilation. Written in Rust with egui. Input executables are not launched.
+## What is UIE?
 
-## Download and run
+UIE connects detection, extraction and decompilation in one window. Drop in a file, watch the stages, then browse the available source or pseudocode with its analysis report. The backends do the decompilation; UIE handles routing, setup and the workspace around them.
 
-Download **UIE.exe** from [Releases](https://github.com/xreamm1/unpack-it-easy/releases). Open or drag a file into the window. Required backends are downloaded automatically into `engines` beside the executable. The initial setup requires internet access and several gigabytes of disk space. Keep `UIE.exe` and `engines` together.
+It is useful when you want to inspect an unfamiliar application without manually connecting a separate tool for every format.
 
-English is the default for new installations. Select **English** or **русский** in the toolbar.
+[![UIE code viewer and analysis workspace](assets/workspace.png)](https://github.com/xreamm1/unpack-it-easy/releases/latest)
 
-For Linux builds and native backend setup see [Linux instructions](docs/linux.md). The automatic PowerShell installer and executable updater are Windows-only.
+## Quick start
 
-## Features
+1. **[Download UIE.exe](https://github.com/xreamm1/unpack-it-easy/releases/latest/download/UIE.exe)** for Windows x64 and place it in a writable folder.
+2. Launch it and drop a file into the window, or choose **open file**.
+3. Let UIE prepare the required analysis engines. First-time setup needs internet access and can take several gigabytes of disk space.
+4. Follow the stages, open the results and save your work as a **`.uie` project**.
 
-- Header, architecture and signature detection, with Detect It Easy compiler/linker/packer details in the stages view.
-- PyInstaller extraction and PyLingual decompilation of Python bytecode; bytecode equivalence is reported separately from functional correctness.
-- Native PE/ELF/Mach-O analysis through Ghidra; .NET recovery through ILSpy.
-- Bounded discovery of related launcher/Nuitka modules, CRT filtering, user-function prioritization, constant initializers, section entropy and data XREF candidates.
-- Electron `.asar` source extraction in Rust, including adjacent `.asar.unpacked` files; Java `.jar` and `.class` decompilation through CFR 0.152.
-- Early MD5/SHA-1/SHA-256 and static indicators: URLs, IPv4/IPv6, file/registry paths, Discord webhooks, Telegram bot endpoints and selected WinAPI names. Evidence includes file, byte offset and encoding. VirusTotal/MalwareBazaar links use the hash; files are not automatically uploaded.
-- Stage timers, object progress, links to incomplete functions, full-log export/copy.
-- Source editor, search, C/Python symbol navigation, virtualized large-file viewing and a clickable minimap.
-- **N** or **F2** opens file-wide identifier rename. Comments and string literals are preserved. This is lexical renaming, without scope/type inference. Rename history and edited files are saved in `.uie`.
-- Portable `.uie` project databases with resources, reports and rename history; legacy `.toker` loading.
-- New result directories and the primary output use `<application>_decompiled`.
+Keep the downloaded `engines` folder beside `UIE.exe`. You do not need to install a system Python for the GUI. English is the default; Russian is available in the toolbar.
 
-## Updates and responsiveness
+**Linux:** build from source and configure native backends using the [Linux guide](docs/linux.md). Compilation is checked in CI; Linux runtime coverage is still limited. The `.exe` download, automatic dependency installer and x64dbg integration are for Windows.
 
-On startup UIE checks the latest stable GitHub release in a background worker with a timeout. The dialog offers **update**, **later** and **do not show again**. The last choice disables automatic checks; the toolbar still allows a manual check. Offline mode skips checks and downloads.
+## What can I open?
 
-An accepted update is downloaded in the background and checked against the release asset SHA-256. Unsaved edits must be saved before restarting. A helper waits for UIE to exit and atomically replaces the executable, preserving a backup and the engines/projects folders.
+| Input | Available output |
+| --- | --- |
+| PyInstaller executables and Python `.pyc` | Extracted resources and recovered Python, with bytecode-equivalence reporting where available |
+| Native PE, ELF and Mach-O binaries | C pseudocode and native-analysis reports |
+| Nuitka and Cython builds, including launcher + `.pyd` layouts | Native C pseudocode, related modules, initialization and XREF candidates |
+| .NET assemblies | C# source |
+| Java `.jar` and `.class` | Java source |
+| Electron `.asar` | Extracted JavaScript, TypeScript and resources present in the archive |
+| UIE `.uie` projects | Saved code, resources, reports and rename history |
 
-Result discovery, source reading and symbol indexing run in background workers. Event processing is limited per frame and log writes are batched. Files initially use virtualized viewing; select edit to modify the source. Very long lines show their first 8192 characters in viewing mode; complete source is retained on disk and in project databases.
+**Recovery depends on the input.** Native pseudocode is not the original source, and full Python recovery or decryption of Nuitka Commercial builds is not verified. Incomplete results stay marked incomplete. [Details and limits](docs/usage.md#limits-and-verification).
 
-## Native Python builds and debugger
+## Inside the workspace
 
-Nuitka and Cython compile Python to native code. UIE routes these files to Ghidra, not to a Python-bytecode decompiler. Output is C pseudocode and supporting evidence; original Python reconstruction is not guaranteed.
+- **See what is happening.** Stage timers, object counters, logs and links from reported problems to the affected code.
+- **Get an early picture.** Compiler and packer signatures, MD5/SHA-1/SHA-256, URLs, IPs, paths, webhook strings and selected WinAPI indicators. External hash lookups are optional; files are not automatically uploaded.
+- **Browse larger outputs.** Virtualized viewing, a clickable minimap, search and a function tree. Rename identifiers with **N / F2** and keep the history in your project.
+- **Inspect native Python builds.** Related-module discovery, CRT filtering, constant-initializer candidates, section entropy and Python-string XREFs.
+- **Keep your work.** Save portable `.uie` databases, copy or export logs, and reopen edited files with their resources.
+- **Use a debugger when needed.** Optional x64dbg/x32dbg integration on Windows. Starting a sample under the debugger is an explicit action; normal static analysis does not run input executables.
 
-- User/module initializers and Python-related string XREF candidates are prioritized.
-- Failed functions get a conservative retry and then an explicitly marked disassembly fallback.
-- Entropy, constants initialization and data XREF reports help locate candidate processing sites. They do not automatically decrypt Nuitka Commercial constants.
-- Hybrid launcher builds containing `app/*.pyd` prioritize application modules and exclude the separate `runtime` dependency tree from automatic decompilation. The discovery report records this exclusion.
-- The Windows **x64dbg / x32dbg** toolbar button downloads a pinned official snapshot with a SHA-256 check. Select an empty debugger or explicitly start the selected PE executable under the debugger. This is a separate action that starts a target process; static analysis does not launch targets. ARM64 and non-PE debugging are unsupported by this integration.
-- Offline bundle preparation includes x64dbg on Windows. Linux uses native analysis backends and does not offer the Windows debugger integration.
+UIE currently routes work through Detect It Easy, Ghidra, PyLingual, ILSpy and CFR. See [third-party components and licenses](THIRD_PARTY.md).
 
-The known-source test in `tests/fixtures/nuitka_sample.py` was compiled with Nuitka 4.3.5 / CPython 3.12 and analyzed: 488 functions emitted, no decompilation failures. This validates the native analysis route, not Python source equivalence. A supplied hybrid application showed Cython markers in its extension modules; it is not evidence of Nuitka Commercial support.
+## Prepare once, work offline
 
-## About and donations
+While online, choose the Python version you need and click **download offline bundle**. Once preparation finishes, enable **offline** to stop automatic downloads and update checks.
 
-The About dialog shows author information, version, repository and the purpose of donations: UIE development, new formats and bug fixes. BTC, LTC, USDT on TRC20, TON and TRX addresses are embedded in `assets/donations.json`; the selected address has a QR code and copy button. No payment is submitted by the application. XMR is not listed.
+Copy `UIE.exe` together with `engines` to move the prepared installation. Python 3.8–3.14 can be selected; the all-versions option needs multiple gigabytes. Missing components are reported instead of fetched while offline.
 
-## Offline preparation and diagnostics
+[Offline setup and command-line usage](docs/usage.md#offline-mode) · [Troubleshooting and startup logs](docs/usage.md#offline-preparation-and-diagnostics)
 
-Each preparation attempt gets a fresh directory under `engines/offline-preparation`, so existing log files no longer break retries. Downloads retry transient failures and record successful Python versions individually. Errors launching the GUI are recorded in `startup-error.log` beside the settings file, including on Windows without a visible console. A reported startup failure on a customized Windows VM has not been reproduced.
+## Help improve UIE
 
-UIE's own log messages and reports are translated for display and log export. Raw per-backend log files retain original diagnostic text; arbitrary output from external tools and operating systems may remain in its original language.
+UIE is still being actively tested. If it saves you time, **[give the repo a star](https://github.com/xreamm1/unpack-it-easy/stargazers)** so more people can find it.
 
-## Offline mode
+Found a crash, a failed extraction or an incorrect result? [Open an issue](https://github.com/xreamm1/unpack-it-easy/issues/new) with your OS, UIE version, the failing stage and the exported log. Include a small reproducible sample when you can share it, and remove private paths, tokens and other sensitive data from logs before posting.
 
-While online, select a Python version or **all python versions**, then click **download offline bundle**. This prepares DIE, Python/PyLingual, Ghidra/Java, ILSpy and CFR, plus the selected Python interpreters and model snapshots under `engines`. The all-versions option prepares Python **3.8–3.14** and requires multiple gigabytes. Preparation can be cancelled and rerun; successful version preparations are recorded in `engines/offline-ready.json`.
+You can also support new-format work and bug fixes through **about → support development** in the app. Contributions and reproducible bug reports are welcome too.
 
-After successful preparation, the GUI enables **offline**. This blocks automatic engine downloads and enables offline flags for Hugging Face, Transformers and uv. Missing components produce an error instead of downloading. External hash lookup links are disabled in this mode. Copy the whole `engines` directory alongside the executable when moving the offline installation.
+## Build from source
 
-Command line preparation:
-
-```cmd
-UIE.exe --prepare-offline all
-UIE.exe --prepare-offline 3.14
-```
-
-Logs: `engines/offline-preparation/`. Offline Python 3.14 preparation and decompilation are tested; the remaining selectable Python versions require their corresponding downloads. Python 3.6/3.7 and experimental 3.15 offline bundles are not supported by this packaging.
-
-## Limits and verification
-
-Decompilation does not guarantee the original source or a runnable project. Native output is C pseudocode. Failed Ghidra functions stay marked incomplete and include an address-labelled disassembly fallback. Entropy/XREFs identify candidates, not proof of encryption or decryption. Static indicators do not prove executed network activity or process injection.
-
-Protected Nuitka Commercial reconstruction has not been validated on a real protected sample. Archive extraction is bounded and rejects traversal paths; external decompilers run with the current user's permissions.
-
-## Build
-
-Windows with Rust and the MSVC C++ build tools:
+On Windows, install Rust and the MSVC C++ build tools:
 
 ```cmd
 cargo build --release --locked
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Output: `target\release\UIE.exe`. GUI runtime does not require a system Python installation.
+Output: `target\release\UIE.exe`. For Linux prerequisites, see [the Linux guide](docs/linux.md).
 
-## Русский
+<details>
+<summary>Development checks</summary>
 
-Откройте или перетащите файл в UIE. Программа определит формат, покажет этапы и откроет доступные исходники. Язык переключается в верхней панели. Кнопка подготовки офлайн-комплекта заранее скачивает движки и модели в `engines`; режим «офлайн» запрещает автоматические загрузки. Переименование — `N`/`F2`, сохранение проекта — `.uie`. Полная эквивалентность и восстановление оригинального кода не гарантируются.
+```cmd
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
 
-See [third-party components](THIRD_PARTY.md) for backend licenses and sources.
+</details>
+
+[Technical notes](docs/usage.md) · [Backend evaluation](docs/backend-evaluation.md) · [MIT license](LICENSE)
