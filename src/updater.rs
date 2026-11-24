@@ -14,6 +14,7 @@ pub struct Release {
     pub version: String,
     pub url: String,
     pub sha256: String,
+    pub notes: String,
 }
 pub enum Message {
     Checked(Result<Option<Release>, String>),
@@ -22,6 +23,8 @@ pub enum Message {
 #[derive(Deserialize)]
 struct ApiRelease {
     tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
     #[serde(default)]
     draft: bool,
     #[serde(default)]
@@ -34,6 +37,14 @@ struct Asset {
     browser_download_url: String,
     digest: Option<String>,
     size: u64,
+}
+const MAX_NOTES_CHARS: usize = 16_000;
+fn bounded_notes(notes: &str) -> String {
+    let mut output: String = notes.chars().take(MAX_NOTES_CHARS).collect();
+    if notes.chars().count() > MAX_NOTES_CHARS {
+        output.push_str("\n[Release notes truncated; see GitHub for the full text]");
+    }
+    output
 }
 fn version(text: &str) -> Option<[u64; 3]> {
     let values = text
@@ -75,6 +86,7 @@ pub fn parse(bytes: &[u8], current: &str) -> Result<Option<Release>, String> {
         version: api.tag_name,
         url: asset.browser_download_url,
         sha256: hash.to_ascii_lowercase(),
+        notes: bounded_notes(api.body.as_deref().unwrap_or_default()),
     }))
 }
 fn curl(url: &str, path: &Path, limit: u64, timeout: u64) -> Result<(), String> {
@@ -233,6 +245,27 @@ pub fn install(staged: &Path, hash: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_notes_preserve_text_and_handle_absent_or_long_body() {
+        let mut value = serde_json::json!({"tag_name":"v0.5.0","body":"## Changes\n- Fixed a crash\n- исправлено окно","assets":[{"name":"UIE.exe","browser_download_url":"https://github.com/xreamm1/unpack-it-easy/releases/download/v0.5.0/UIE.exe","size":100,"digest":format!("sha256:{}","a".repeat(64))}]});
+        let parse_release = |value: &serde_json::Value| {
+            parse(&serde_json::to_vec(value).unwrap(), "0.4.1")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(parse_release(&value).notes, value["body"].as_str().unwrap());
+        value["body"] = serde_json::Value::Null;
+        assert!(parse_release(&value).notes.is_empty());
+        value.as_object_mut().unwrap().remove("body");
+        assert!(parse_release(&value).notes.is_empty());
+        value["body"] = serde_json::json!("я".repeat(MAX_NOTES_CHARS + 1));
+        let notes = parse_release(&value).notes;
+        assert!(notes.ends_with("[Release notes truncated; see GitHub for the full text]"));
+        assert_eq!(
+            notes.chars().take(MAX_NOTES_CHARS).collect::<String>(),
+            "я".repeat(MAX_NOTES_CHARS)
+        );
+    }
     #[test]
     #[cfg(windows)]
     fn installer_replaces_only_after_hash_verification() {

@@ -26,7 +26,7 @@ For Linux builds and native backend setup see [Linux instructions](linux.md). Th
 
 ## Updates and responsiveness
 
-On startup UIE checks the latest stable GitHub release in a background worker with a timeout. The dialog offers **update**, **later** and **do not show again**. The last choice disables automatic checks; the toolbar still allows a manual check. Offline mode skips checks and downloads.
+On startup UIE checks the latest stable GitHub release in a background worker with a timeout. The centered dialog displays the GitHub release notes before offering **update**, **later** and **do not show again**. Notes are shown as plain text, with a link to the full release page. Missing notes have a fallback message; long notes are bounded. The last choice disables automatic checks; the toolbar still allows a manual check. Offline mode skips checks and downloads.
 
 An accepted update is downloaded in the background and checked against the release asset SHA-256. Unsaved edits must be saved before restarting. A helper waits for UIE to exit and atomically replaces the executable, preserving a backup and the engines/projects folders.
 
@@ -93,3 +93,31 @@ Output: `target\release\UIE.exe`. GUI runtime does not require a system Python i
 Откройте или перетащите файл в UIE. Программа определит формат, покажет этапы и откроет доступные исходники. Язык переключается в верхней панели. Кнопка подготовки офлайн-комплекта заранее скачивает движки и модели в `engines`; режим «офлайн» запрещает автоматические загрузки. Переименование — `N`/`F2`, сохранение проекта — `.uie`. Полная эквивалентность и восстановление оригинального кода не гарантируются.
 
 See [third-party components](../THIRD_PARTY.md) for backend licenses and sources.
+
+## Crash reports and backtraces
+
+For Rust panic diagnostics, enable the environment variable before launching UIE.
+
+PowerShell:
+
+```powershell
+$env:RUST_BACKTRACE = "1"
+.\UIE.exe
+```
+
+Command Prompt:
+
+```cmd
+set RUST_BACKTRACE=1
+UIE.exe
+```
+
+Linux:
+
+```sh
+RUST_BACKTRACE=1 ./UIE
+```
+
+Use `RUST_BACKTRACE=full` for the expanded stack. UIE writes the latest Rust panic, backtrace status, version, OS, architecture and thread name to `crash-report.log` next to the settings file. The standard stderr panic output is also preserved. On Windows the default location is `%LOCALAPPDATA%\UnpackItEasy\crash-report.log`; on Linux it is `$XDG_CONFIG_HOME/UnpackItEasy/crash-report.log` or `$HOME/.config/UnpackItEasy/crash-report.log`.
+
+GUI initialization errors remain in `startup-error.log` in the same directory. Release builds may have limited symbols. For source-level traces use a development build (`cargo run`). Backtraces diagnose Rust panics; they do not capture all native crashes, access violations, hangs or forced process termination. Review logs for private paths and sensitive data before attaching them to an issue.

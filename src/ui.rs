@@ -521,6 +521,7 @@ impl Toker {
             let mut open = true;
             egui::Window::new(tr("доступно обновление"))
                 .id(egui::Id::new("update-dialog"))
+                .default_width(560.0)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .open(&mut open)
                 .collapsible(false)
@@ -531,6 +532,26 @@ impl Toker {
                         env!("CARGO_PKG_VERSION"),
                         release.version
                     ));
+                    ui.separator();
+                    ui.label(tr("что нового"));
+                    egui::ScrollArea::vertical()
+                        .id_salt("update-notes")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            if release.notes.trim().is_empty() {
+                                ui.weak(tr("описание обновления не опубликовано"));
+                            } else {
+                                ui.add(egui::Label::new(&release.notes).wrap().selectable(true));
+                            }
+                        });
+                    ui.hyperlink_to(
+                        tr("полный changelog на github"),
+                        format!(
+                            "https://github.com/xreamm1/unpack-it-easy/releases/tag/{}",
+                            release.version
+                        ),
+                    );
+                    ui.separator();
                     if self.update_rx.is_some() {
                         ui.spinner();
                         ui.label(tr("загрузка обновления"));

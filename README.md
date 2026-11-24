@@ -70,7 +70,7 @@ While online, choose the Python version you need and click **download offline bu
 
 Copy `UIE.exe` together with `engines` to move the prepared installation. Python 3.8–3.14 can be selected; the all-versions option needs multiple gigabytes. Missing components are reported instead of fetched while offline.
 
-[Offline setup and command-line usage](docs/usage.md#offline-mode) · [Troubleshooting and startup logs](docs/usage.md#offline-preparation-and-diagnostics)
+[Offline setup and command-line usage](docs/usage.md#offline-mode) · [Troubleshooting and crash reports](docs/usage.md#crash-reports-and-backtraces)
 
 ## Help improve UIE
 

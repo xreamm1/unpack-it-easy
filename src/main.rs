@@ -4,6 +4,7 @@ mod archives;
 mod database;
 mod debugger;
 mod detect;
+mod diagnostics;
 mod engine;
 mod indicators;
 mod language;
@@ -87,13 +88,7 @@ fn headless(args: &[std::ffi::OsString]) -> i32 {
 }
 
 fn main() -> eframe::Result<()> {
-    std::panic::set_hook(Box::new(|info| {
-        let path = engine::config_path().with_file_name("startup-error.log");
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(path, info.to_string());
-    }));
+    diagnostics::install_hook();
     let args: Vec<_> = std::env::args_os().collect();
     if args.get(1).is_some_and(|a| a == "--prepare-debugger") {
         let result = debugger::prepare("x64", Settings::load().offline);

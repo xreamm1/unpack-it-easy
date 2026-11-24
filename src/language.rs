@@ -46,6 +46,9 @@ fn translate(text: &str, english: bool) -> String {
 }
 
 const TRANSLATIONS: &[(&str, &str)] = &[
+("что нового","what is new"),
+("описание обновления не опубликовано","no release notes were published"),
+("полный changelog на github","full changelog on GitHub"),
 ("подготовка отладчика","preparing debugger"),
 ("открытие образца в отладчике запускает его процесс","opening a sample in the debugger starts its process"),
 ("открыть пустой отладчик","open empty debugger"),
