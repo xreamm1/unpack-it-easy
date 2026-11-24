@@ -469,6 +469,7 @@ impl Toker {
             let mut open = true;
             egui::Window::new(tr("доступно обновление"))
                 .id(egui::Id::new("update-dialog"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
