@@ -16,7 +16,10 @@ A desktop workspace for binary analysis, unpacking and decompilation, written in
 [![GitHub stars](https://img.shields.io/github/stars/xreamm1/unpack-it-easy?style=flat-square&label=stars)](https://github.com/xreamm1/unpack-it-easy/stargazers)
 [![MIT license](https://img.shields.io/github/license/xreamm1/unpack-it-easy?style=flat-square)](LICENSE)
 
-[Quick start](#quick-start) · [Supported formats](#what-can-i-open) · [Linux setup](docs/linux.md) · [Report a bug](https://github.com/xreamm1/unpack-it-easy/issues/new)
+[![Quick start](https://img.shields.io/badge/Quick_start-24292f?style=for-the-badge)](#quick-start)
+[![Supported formats](https://img.shields.io/badge/Supported_formats-24292f?style=for-the-badge)](#what-can-i-open)
+[![Linux setup](https://img.shields.io/badge/Linux_setup-24292f?style=for-the-badge)](docs/linux.md)
+[![Report a bug](https://img.shields.io/badge/Report_a_bug-24292f?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy/issues/new)
 
 </div>
 
