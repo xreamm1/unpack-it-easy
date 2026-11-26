@@ -4,9 +4,11 @@
 
 # Unpack It Easy
 
-### Open a binary. Follow the analysis. Explore the code.
+### Open a file. Find its format. Read what can be recovered.
 
-A desktop workspace for binary analysis, unpacking and decompilation, written in Rust.
+Recover Python, C#, Java and archive sources, inspect native pseudocode, and keep the results in one desktop workspace.
+
+**Written in Rust · Local analysis · Portable `.uie` projects**
 
 [![Download UIE for Windows x64](https://img.shields.io/badge/Download-UIE.exe-2ea44f?style=for-the-badge)](https://github.com/xreamm1/unpack-it-easy/releases/latest/download/UIE.exe)
 [![Latest release](https://img.shields.io/github/v/release/xreamm1/unpack-it-easy?style=for-the-badge&label=latest)](https://github.com/xreamm1/unpack-it-easy/releases/latest)
@@ -23,13 +25,28 @@ A desktop workspace for binary analysis, unpacking and decompilation, written in
 
 </div>
 
-## What is UIE?
+## See the recovered code
 
-UIE connects detection, extraction and decompilation in one window. Drop in a file, watch the stages, then browse the available source or pseudocode with its analysis report. The backends do the decompilation; UIE handles routing, setup and the workspace around them.
+[![UIE browsing real recovered Python from arkyxscript](assets/code-demo.gif)](assets/code-demo.gif)
 
-It is useful when you want to inspect an unfamiliar application without manually connecting a separate tool for every format.
+*Actual UIE interface, browsing Python previously recovered from `arkyxscript`. The demo shows code navigation, not a timed decompilation. Recovery of this sample is partial; the review notice remains visible.*
 
-[![UIE code viewer and analysis workspace](assets/workspace.png)](https://github.com/xreamm1/unpack-it-easy/releases/latest)
+<details>
+<summary>Open a still screenshot</summary>
+
+[![Recovered Python in the UIE editor](assets/workspace.png)](assets/workspace.png)
+
+</details>
+
+## From file to an inspectable project
+
+Drop in a file and UIE identifies its format, chooses an analysis route, prepares the required engine, and opens the available code with its report. You can follow progress, jump to functions, rename symbols and save the whole workspace for later.
+
+| Identify | Recover | Explore |
+| --- | --- | --- |
+| Architecture, compiler and packer hints, hashes and indicators | Archive contents, language sources or native pseudocode | Function navigation, minimap, search, reports and `.uie` projects |
+
+UIE brings the tools together and adds its own Rust analysis passes. You do not need to assemble a separate workflow for each supported format.
 
 ## Quick start
 
@@ -40,7 +57,7 @@ It is useful when you want to inspect an unfamiliar application without manually
 
 Keep the downloaded `engines` folder beside `UIE.exe`. You do not need to install a system Python for the GUI. English is the default; Russian is available in the toolbar.
 
-**Linux:** build from source and configure native backends using the [Linux guide](docs/linux.md). Compilation is checked in CI; Linux runtime coverage is still limited. The `.exe` download, automatic dependency installer and x64dbg integration are for Windows.
+**Other platforms:** [Linux setup](docs/linux.md) · [macOS setup](docs/macos.md). Source builds and native backend setup are documented; runtime coverage is limited. The ready-to-run `.exe`, automatic Windows dependency installer and x64dbg integration are for Windows.
 
 ## What can I open?
 
@@ -58,26 +75,29 @@ Keep the downloaded `engines` folder beside `UIE.exe`. You do not need to instal
 
 ## Inside the workspace
 
+- **Start with an index.** The Rust PE AMD64 pass finds file-backed function candidates first. With lazy native analysis, request a function's pseudocode when you select it instead of decompiling every body up front.
+- **Inspect more than pseudocode.** Bounded Rust passes track constants, simple XOR/shift/rotate operations, string candidates and constant-XOR CRC32 tables. Results carry addresses and evidence limits.
 - **See what is happening.** Stage timers, object counters, logs and links from reported problems to the affected code.
 - **Get an early picture.** Compiler and packer signatures, MD5/SHA-1/SHA-256, URLs, IPs, paths, webhook strings and selected WinAPI indicators. External hash lookups are optional; files are not automatically uploaded.
 - **Browse larger outputs.** Virtualized viewing, a clickable minimap, search and a function tree. Rename identifiers with **N / F2** and keep the history in your project.
 - **Inspect native Python builds.** Related-module discovery, CRT filtering, constant-initializer candidates, section entropy and Python-string XREFs.
 - **Keep your work.** Save portable `.uie` databases, copy or export logs, and reopen edited files with their resources.
+- **Compare and continue elsewhere.** Compare projects and export native symbols and comments for x64dbg.
 - **Use a debugger when needed.** Optional x64dbg/x32dbg integration on Windows. Starting a sample under the debugger is an explicit action; normal static analysis does not run input executables.
 
-UIE currently routes work through Detect It Easy, Ghidra, PyLingual, ILSpy and CFR. See [third-party components and licenses](THIRD_PARTY.md).
+UIE combines its Rust passes with Detect It Easy, Ghidra, RetDec, PyLingual, ILSpy, CFR and UPX where applicable. Analysis backends retain their own capabilities and limits. See [third-party components and licenses](THIRD_PARTY.md).
 
 ## Prepare once, work offline
 
 While online, choose the Python version you need and click **download offline bundle**. Once preparation finishes, enable **offline** to stop automatic downloads and update checks.
 
-Copy `UIE.exe` together with `engines` to move the prepared installation. Python 3.8–3.14 can be selected; the all-versions option needs multiple gigabytes. Missing components are reported instead of fetched while offline.
+Copy `UIE.exe` together with `engines` to move the prepared installation. Python 3.8–3.14 can be selected; the all-versions option needs multiple gigabytes. Model downloads retain resumable partial files, and successful version preparation is recorded. Missing components are reported instead of fetched while offline.
 
 [Offline setup and command-line usage](docs/usage.md#offline-mode) · [Troubleshooting and crash reports](docs/usage.md#crash-reports-and-backtraces)
 
 ## Help improve UIE
 
-UIE is still being actively tested. If it saves you time, **[give the repo a star](https://github.com/xreamm1/unpack-it-easy/stargazers)** so more people can find it.
+If UIE saves you setup time, **[give the repo a star](https://github.com/xreamm1/unpack-it-easy/stargazers)** or share a reproducible sample that helps improve recovery.
 
 Found a crash, a failed extraction or an incorrect result? [Open an issue](https://github.com/xreamm1/unpack-it-easy/issues/new) with your OS, UIE version, the failing stage and the exported log. Include a small reproducible sample when you can share it, and remove private paths, tokens and other sensitive data from logs before posting.
 
@@ -104,4 +124,4 @@ cargo test --locked
 
 </details>
 
-[Technical notes](docs/usage.md) · [Backend evaluation](docs/backend-evaluation.md) · [MIT license](LICENSE)
+[Technical notes](docs/usage.md) · [Native recovery and limits](docs/native-recovery.md) · [Backend evaluation](docs/backend-evaluation.md) · [MIT license](LICENSE)
