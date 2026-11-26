@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Root, [ValidateSet('detect','python','native','dotnet','java')][string]$Route='detect')
+param([Parameter(Mandatory=$true)][string]$Root, [ValidateSet('detect','python','native','dotnet','java','retdec')][string]$Route='detect')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -199,6 +199,43 @@ if ($Route -eq 'dotnet') {
     $manifest['dotnet_root'] = $dotnet
     }
     $manifest['ilspy'] = $ilspy
+}
+
+if ($Route -eq 'retdec') {
+    $retdecRoot = Join-Path $Root 'retdec'
+    $retdec = Join-Path $retdecRoot 'bin/retdec-decompiler.exe'
+    if (!(Test-Path -LiteralPath $retdec) -or !(Test-Path -LiteralPath (Join-Path $retdecRoot 'share/retdec/support')) -or !(Test-Path -LiteralPath (Join-Path $retdecRoot 'LICENSE-THIRD-PARTY'))) {
+        $archive = Join-Path $cache 'RetDec-v5.0-Windows-Release.7z'
+        Fetch 'https://github.com/avast/retdec/releases/download/v5.0/RetDec-v5.0-Windows-Release.7z' $archive '496a2d86420115eaa21ac8ff9b202282525f0a46a28a78c983f2cca0643ab101'
+        New-Item -ItemType Directory -Path $retdecRoot -Force | Out-Null
+        Checked (Join-Path $env:SystemRoot 'System32/tar.exe') @('-xf',$archive,'-C',$retdecRoot,'bin','share','LICENSE','LICENSE-PELIB','LICENSE-THIRD-PARTY','README.md','CHANGELOG.md')
+    }
+    if (!(Test-Path -LiteralPath $retdec)) { throw 'RetDec executable missing' }
+    $crypto = Join-Path $retdecRoot 'bin/libcrypto-1_1-x64.dll'
+    if (!(Test-Path -LiteralPath $crypto) -or !(Test-Path -LiteralPath (Join-Path $retdecRoot 'licenses/Python-OpenSSL-LICENSE.txt')) -or !(Test-Path -LiteralPath (Join-Path $retdecRoot 'licenses/OpenSSL-1.1.1-LICENSE.txt'))) {
+        $uv = Find-Binary (Join-Path $Root 'uv') 'uv.exe'
+        if (!$uv) {
+            Release-Zip 'astral-sh/uv' '^uv-x86_64-pc-windows-msvc\.zip$' (Join-Path $Root 'uv')
+            $uv = Find-Binary (Join-Path $Root 'uv') 'uv.exe'
+        }
+        if (!$uv) { throw 'Managed Python installer missing for RetDec OpenSSL dependency' }
+        $env:UV_PYTHON_INSTALL_DIR = Join-Path $Root 'python'
+        $env:UV_PYTHON_BIN_DIR = Join-Path $Root 'python-bin'
+        $env:UV_CACHE_DIR = Join-Path $Root 'cache'
+        Checked $uv @('python','install','3.8')
+        $python38 = (& $uv python find --managed-python 3.8 | Select-Object -Last 1).Trim()
+        if (!(Test-Path -LiteralPath $python38)) { throw 'Managed Python 3.8 dependency not found' }
+        $python38Root = Split-Path $python38
+        $cryptoSource = Join-Path $python38Root 'DLLs/libcrypto-1_1-x64.dll'
+        if (!(Test-Path -LiteralPath $cryptoSource)) { throw 'Official managed Python is missing the required OpenSSL DLL' }
+        $licenseRoot = Join-Path $retdecRoot 'licenses'
+        New-Item -ItemType Directory -Path $licenseRoot -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $python38Root 'LICENSE.txt') -Destination (Join-Path $licenseRoot 'Python-OpenSSL-LICENSE.txt') -Force
+        Fetch 'https://raw.githubusercontent.com/openssl/openssl/OpenSSL_1_1_1w/LICENSE' (Join-Path $licenseRoot 'OpenSSL-1.1.1-LICENSE.txt') 'c32913b33252e71190af2066f08115c69bc9fddadf3bf29296e20c835389841c'
+        Copy-Item -LiteralPath $cryptoSource -Destination $crypto -Force
+    }
+    Checked $retdec @('--version')
+    $manifest['retdec'] = $retdec
 }
 
 $merged = @{}

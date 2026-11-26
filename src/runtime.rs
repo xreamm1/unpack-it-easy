@@ -168,7 +168,7 @@ pub fn prepare(
         );
     }
     if !cfg!(windows) {
-        return Err("Missing analysis backend. On Linux install native dependencies and configure engines/engines.json; see docs/linux.md. The Windows PowerShell installer is not used.".into());
+        return Err("Missing analysis backend. On Linux/macOS install native dependencies and configure engines/engines.json; see docs/linux.md and docs/macos.md. The Windows PowerShell installer is not used.".into());
     }
     let root = root();
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -257,10 +257,23 @@ pub fn prepare_offline(
             prepare(&mut settings, &route, true, &output, &cancel, &events)?;
         }
         crate::archives::prepare_cfr(&output, &cancel, &events)?;
+        if cfg!(any(windows, target_os = "linux")) {
+            crate::unpack::prepare(false, &output, &cancel, &events)?;
+        } else {
+            let _ = events.send(Event::Log(
+                "UPX: install upx on PATH to use offline unpacking on this host".into(),
+            ));
+        }
         if cfg!(windows) {
             crate::debugger::prepare("x64", false)?;
+            crate::retdec::prepare(false, &output, &cancel, &events)?;
         }
         let script = output.join("prepare_offline.py");
+        fs::write(
+            output.join("model_download.py"),
+            include_str!("model_download.py"),
+        )
+        .map_err(|e| e.to_string())?;
         fs::write(&script, include_str!("prepare_offline.py")).map_err(|e| e.to_string())?;
         run_tool(
             &settings.python,

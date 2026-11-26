@@ -3,10 +3,10 @@ use std::{backtrace::Backtrace, fs, io::Write};
 pub fn install_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let trace = Backtrace::capture();
+        let trace = Backtrace::force_capture();
         let thread = std::thread::current();
         let report = format!(
-            "UIE {}\nos: {} / {}\nthread: {}\n{info}\n\nbacktrace status: {:?}\n{trace}\n\nSet RUST_BACKTRACE=1 or RUST_BACKTRACE=full before starting UIE to capture Rust panic backtraces. Release binaries may have limited symbols. This does not capture native access violations or forced process termination.\n",
+            "UIE {}\nos: {} / {}\nthread: {}\n{info}\n\nbacktrace status: {:?}\n{trace}\n\nRust panic backtraces are captured automatically without environment setup. Release binaries may have limited symbols. This does not capture native access violations or forced process termination.\n",
             env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH,
             thread.name().unwrap_or("unnamed"), trace.status()
         );
@@ -33,13 +33,13 @@ mod tests {
     }
 
     #[test]
-    fn panic_subprocess_writes_enabled_backtrace() {
+    fn panic_subprocess_writes_backtrace_without_environment_setup() {
         let root = std::env::temp_dir().join(format!("uie-panic-{}", std::process::id()));
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "diagnostics::tests::panic_fixture"])
             .env("LOCALAPPDATA", &root)
             .env("XDG_CONFIG_HOME", &root)
-            .env("RUST_BACKTRACE", "1")
+            .env_remove("RUST_BACKTRACE")
             .output()
             .unwrap();
         assert!(!output.status.success());

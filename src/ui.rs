@@ -35,12 +35,8 @@ struct Document {
     dirty: bool,
     line_starts: Vec<usize>,
     symbols: Vec<(usize, String, bool)>,
-    numbers: String,
     max_columns: usize,
-    fast_view: bool,
     line_cache: HashMap<usize, egui::text::LayoutJob>,
-    galley: Option<std::sync::Arc<egui::Galley>>,
-    galley_len: usize,
 }
 
 impl Document {
@@ -51,15 +47,10 @@ impl Document {
             dirty: false,
             line_starts: vec![],
             symbols: vec![],
-            numbers: String::new(),
             max_columns: 0,
-            fast_view: false,
             line_cache: HashMap::new(),
-            galley: None,
-            galley_len: 0,
         };
         doc.reindex();
-        doc.fast_view = true;
         doc
     }
     fn reindex(&mut self) {
@@ -89,7 +80,7 @@ impl Document {
                 self.symbols.push((line, symbol.to_string(), true));
             } else if native && symbol.to_ascii_lowercase().starts_with("/* function at ") {
                 let name = symbol
-                    .rsplit_once(": ")
+                    .split_once(": ")
                     .map(|(_, name)| name.trim_end_matches("*/").trim().to_string())
                     .or_else(|| {
                         lines[line + 1..lines.len().min(line + 13)]
@@ -115,18 +106,14 @@ impl Document {
                     "_initConstants",
                     "PyInit_",
                     "__pyx_",
+                    " [cython:",
                 ]
                 .iter()
                 .any(|marker| name.contains(marker));
                 self.symbols.push((line, name, user));
             }
         }
-        self.numbers = (1..=self.line_starts.len())
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
         self.line_cache.clear();
-        self.galley = None;
     }
 }
 
@@ -134,6 +121,13 @@ struct NativeReport {
     file: PathBuf,
     report: serde_json::Value,
     lines: HashMap<String, usize>,
+}
+
+struct RestoredProject {
+    path: PathBuf,
+    project: crate::project::Project,
+    indicators: Option<crate::indicators::Report>,
+    workspace: LoadedWorkspace,
 }
 
 struct LoadedWorkspace {
@@ -306,7 +300,9 @@ impl LoadedWorkspace {
                                 })
                                 .collect();
                             for function in report["functions"].as_array().into_iter().flatten() {
-                                if function["success"].as_bool() == Some(false) {
+                                if function["success"].as_bool() == Some(false)
+                                    && function["lazy"].as_bool() != Some(true)
+                                {
                                     let line = function["line"].as_u64().unwrap_or(1) as usize;
                                     if !self
                                         .session
@@ -417,7 +413,12 @@ pub struct Toker {
     available_update: Option<crate::updater::Release>,
     downloaded_update: Option<PathBuf>,
     workspace_rx: Option<mpsc::Receiver<LoadedWorkspace>>,
+    project_rx: Option<mpsc::Receiver<Result<RestoredProject, String>>>,
     document_rx: Option<mpsc::Receiver<Result<Document, String>>>,
+    lazy_rx: Option<mpsc::Receiver<(PathBuf, Result<PathBuf, String>)>>,
+    utility_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    literal_query: String,
+    literal_hits: Vec<(String, Option<Problem>)>,
 }
 
 impl Toker {
@@ -642,7 +643,12 @@ impl Toker {
             available_update: None,
             downloaded_update: None,
             workspace_rx: None,
+            project_rx: None,
             document_rx: None,
+            lazy_rx: None,
+            utility_rx: None,
+            literal_query: String::new(),
+            literal_hits: vec![],
         };
         if let Some(path) = app
             .queued_input
@@ -657,43 +663,72 @@ impl Toker {
     }
 
     fn restore_project(&mut self, path: PathBuf) {
-        match crate::project::open(&path) {
-            Ok(project) => {
-                self.input = Some(path.clone());
-                self.base_path = Some(path);
-                self.input_hash = project.input_sha256.clone();
-                self.verification = project.verification.clone();
-                self.base_dirty = false;
-                self.analysis = Some(project.analysis);
-                self.indicators = fs::read(project.output.join("indicators.json"))
+        self.busy = true;
+        self.status = "loading and verifying project files".into();
+        self.receiver = None;
+        self.workspace_rx = None;
+        self.document_rx = None;
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        self.project_rx = Some(rx);
+        thread::spawn(move || {
+            let result = (|| -> Result<RestoredProject, String> {
+                let project = crate::project::open(&path)?;
+                let indicators = fs::read(project.output.join("indicators.json"))
                     .ok()
-                    .and_then(|data| serde_json::from_slice(&data).ok());
-                self.output = Some(project.output);
-                self.session = self
-                    .output
-                    .as_ref()
-                    .and_then(|p| fs::read(p.join("uie-session.json")).ok())
-                    .and_then(|data| serde_json::from_slice(&data).ok())
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                let session = fs::read(project.output.join("uie-session.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                     .unwrap_or_default();
-                self.search = self.session.search.clone();
-                self.clock = StageClock::default();
-                self.logs.clear();
-                self.log_file = None;
-                if let Some(output) = self.output.clone() {
-                    self.attach_log(&output);
+                let workspace = LoadedWorkspace::read(project.output.clone(), session);
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("project loading cancelled".into());
                 }
-                self.files.clear();
-                self.documents.clear();
-                self.active = None;
-                self.complete = true;
-                self.stage = 6;
-                self.status = project.verification.clone();
-                self.log(&project.verification);
-                self.load_sources();
-                self.tab = self.session.tab.min(3);
-            }
-            Err(error) => self.status = error,
+                Ok(RestoredProject {
+                    path,
+                    project,
+                    indicators,
+                    workspace,
+                })
+            })();
+            let _ = tx.send(result);
+        });
+    }
+    fn apply_restored_project(&mut self, restored: RestoredProject) {
+        let RestoredProject {
+            path,
+            project,
+            indicators,
+            workspace,
+        } = restored;
+        self.input = Some(path.clone());
+        self.base_path = Some(path);
+        self.input_hash = project.input_sha256;
+        self.verification = project.verification.clone();
+        self.base_dirty = false;
+        self.analysis = Some(project.analysis);
+        self.indicators = indicators;
+        self.output = Some(project.output);
+        self.session = workspace.session;
+        self.search = self.session.search.clone();
+        self.clock = StageClock::default();
+        self.logs.clear();
+        self.log_file = None;
+        if let Some(output) = self.output.clone() {
+            self.attach_log(&output);
         }
+        self.files = workspace.files;
+        self.documents = workspace.documents;
+        self.active = workspace.active;
+        self.native_reports = workspace.native_reports;
+        self.triage_report = workspace.triage_report;
+        self.complete = true;
+        self.stage = 6;
+        self.status = project.verification.clone();
+        self.log(&project.verification);
+        self.tab = self.session.tab.min(3);
     }
     fn log(&mut self, text: &str) {
         if let Some(path) = &self.log_file {
@@ -768,6 +803,127 @@ impl Toker {
         }
     }
 
+    fn export_debugger_symbols(&mut self) {
+        let Some(root) = self.output.clone() else {
+            return;
+        };
+        if self.utility_rx.is_some() {
+            return;
+        }
+        let module = self
+            .input
+            .as_ref()
+            .and_then(|input| input.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        let (tx, rx) = mpsc::channel();
+        self.utility_rx = Some(rx);
+        thread::spawn(move || {
+            let result = (|| -> Result<PathBuf, String> {
+                let native: serde_json::Value = serde_json::from_slice(
+                    &fs::read(root.join("native-report.json")).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                let stored = native["native_input"]
+                    .as_str()
+                    .and_then(|path| std::path::Path::new(path).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .or_else(|| native["ghidra_program"].as_str().map(str::to_owned));
+                let module = stored
+                    .or(module)
+                    .ok_or("original module name is missing from project")?;
+                crate::debugger_export::export(&root, &module)
+            })();
+            let _ = tx.send(result);
+        });
+    }
+    fn compare_bases(&mut self) {
+        if self.utility_rx.is_some() {
+            return;
+        }
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("UIE", &["uie", "toker"])
+            .pick_files()
+        else {
+            return;
+        };
+        if paths.len() != 2 {
+            self.status = tr("выбери ровно две базы для сравнения");
+            return;
+        }
+        let output = self
+            .output
+            .clone()
+            .unwrap_or_else(|| crate::project::app_root().join("comparisons"));
+        let (tx, rx) = mpsc::channel();
+        self.utility_rx = Some(rx);
+        self.status = tr("сравнение баз");
+        thread::spawn(move || {
+            let result = (|| -> Result<PathBuf, String> {
+                let report = crate::project_diff::compare(&paths[0], &paths[1])?;
+                fs::create_dir_all(&output).map_err(|e| e.to_string())?;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_nanos();
+                let path = output.join(format!("comparison-{stamp}.json"));
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|e| e.to_string())?;
+                file.write_all(&serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                Ok(path)
+            })();
+            let _ = tx.send(result);
+        });
+    }
+    fn request_lazy(&mut self, path: PathBuf, line: usize) {
+        if self.busy || self.lazy_rx.is_some() {
+            return;
+        }
+        let Some(output) = self.output.as_ref() else {
+            return;
+        };
+        let Some(native) = self.native_reports.iter().find(|native| {
+            output.join(&native.file) == path && native.report["lazy"].as_bool() == Some(true)
+        }) else {
+            return;
+        };
+        let Some(function) = native.report["functions"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| row["line"].as_u64() == Some(line as u64 + 1))
+        }) else {
+            return;
+        };
+        let Some(address) = function["address"].as_str().map(str::to_owned) else {
+            return;
+        };
+        let Some(root) = path
+            .ancestors()
+            .skip(1)
+            .take(16)
+            .find(|parent| {
+                parent.starts_with(output) && parent.join("native-report.json").is_file()
+            })
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let workspace = output.clone();
+        let settings = self.settings.clone();
+        let (tx, rx) = mpsc::channel();
+        self.lazy_rx = Some(rx);
+        self.busy = true;
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        self.status = tr("декомпиляция выбранной функции");
+        thread::spawn(move || {
+            let result = engine::lazy_function_with_cancel(settings, &root, &address, &cancel);
+            let _ = tx.send((workspace, result));
+        });
+    }
+
     fn jump_to_problem(&mut self, problem: &Problem) {
         if problem.file.is_absolute()
             || problem
@@ -783,18 +939,436 @@ impl Toker {
                 self.status = tr("исходник для объекта не создан");
                 return;
             }
-            self.open_document(path);
+            self.open_document(path.clone());
             let line = problem.line.saturating_sub(1);
             self.scroll_to_line = Some(line);
             self.cursor_line = Some(line);
             self.tab = 0;
             self.status = format!("{}: {}", problem.symbol, problem.message);
+            self.request_lazy(path, line);
         }
     }
 
-    fn native_report_panel(&mut self, ui: &mut egui::Ui) {
+    fn constant_panel(&mut self, ui: &mut egui::Ui, in_editor: bool) {
         let mut selected = None;
         for native in &self.native_reports {
+            if in_editor
+                && !self.active.is_some_and(|index| {
+                    self.output.as_ref().is_some_and(|output| {
+                        let index_path = output.join(&native.file);
+                        let document = &self.documents[index].path;
+                        if index_path == *document {
+                            return true;
+                        }
+                        let Some(parent) = index_path.parent() else {
+                            return false;
+                        };
+                        let source = if parent.file_name().is_some_and(|name| name == "source") {
+                            parent.to_path_buf()
+                        } else {
+                            parent.join("source")
+                        };
+                        document.parent().is_some_and(|directory| {
+                            directory
+                                .file_name()
+                                .is_some_and(|name| name == "functions")
+                                && directory.parent() == Some(source.as_path())
+                        })
+                    })
+                })
+            {
+                continue;
+            }
+            let analysis = &native.report["uie_constant_analysis"];
+            let Some(annotations) = analysis["annotations"].as_array() else {
+                continue;
+            };
+            let functions = native.report["functions"].as_array();
+            let body_address = self
+                .active
+                .and_then(|index| self.documents[index].path.file_stem())
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("FUN_"));
+            let context = if in_editor && body_address.is_some() {
+                functions
+                    .into_iter()
+                    .flatten()
+                    .find(|function| function["address"].as_str() == body_address)
+            } else if in_editor {
+                functions
+                    .into_iter()
+                    .flatten()
+                    .filter(|function| {
+                        function["line"]
+                            .as_u64()
+                            .is_some_and(|line| line <= self.visible_lines.0 as u64 + 1)
+                    })
+                    .max_by_key(|function| function["line"].as_u64().unwrap_or(0))
+                    .or_else(|| functions.and_then(|functions| functions.first()))
+            } else {
+                None
+            };
+            let rows: Vec<_> = annotations
+                .iter()
+                .filter(|row| context.is_none_or(|function| row["function_rva"] == function["rva"]))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(format!(
+                "{} ({})",
+                tr("константы и кандидаты строк"),
+                rows.len()
+            ))
+            .id_salt((&native.file, "uie-folded", in_editor))
+            .default_open(in_editor)
+            .show(ui, |ui| {
+                ui.weak(tr("статические кандидаты — выполнение не наблюдалось"));
+                if analysis["truncated"].as_bool() == Some(true) {
+                    ui.weak(tr("достигнут лимит анализа"));
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt((&native.file, "uie-folded-rows", in_editor))
+                    .max_height(if in_editor { 110.0 } else { 230.0 })
+                    .show_rows(ui, 20.0, rows.len(), |ui, range| {
+                        for index in range {
+                            let row = rows[index];
+                            let text = format!(
+                                "{} · {} = {}",
+                                row["instruction_rva"].as_str().unwrap_or("?"),
+                                row["location"].as_str().unwrap_or("?"),
+                                row["value"].as_str().unwrap_or("?")
+                            );
+                            let text = if row["kind"].as_str() == Some("string_candidate") {
+                                RichText::new(text).color(Color32::from_rgb(235, 192, 98))
+                            } else {
+                                RichText::new(text)
+                            };
+                            if ui
+                                .link(text)
+                                .on_hover_text(tr("перейти к содержащей функции"))
+                                .clicked()
+                            {
+                                if let Some(function) = functions
+                                    .into_iter()
+                                    .flatten()
+                                    .find(|function| function["rva"] == row["function_rva"])
+                                {
+                                    selected = Some(Problem {
+                                        file: native.file.clone(),
+                                        line: function["line"].as_u64().unwrap_or(1) as usize,
+                                        symbol: function["name"].as_str().unwrap_or("?").into(),
+                                        message: tr("статический кандидат"),
+                                    });
+                                }
+                            }
+                        }
+                    });
+            });
+        }
+        if let Some(problem) = selected {
+            self.jump_to_problem(&problem);
+        }
+    }
+    fn literal_search_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(tr("строки и константы всех модулей"));
+            ui.text_edit_singleline(&mut self.literal_query);
+            if ui.button(tr("найти")).clicked() {
+                self.literal_hits.clear();
+                let query = self.literal_query.to_lowercase();
+                if !query.is_empty() {
+                    for native in &self.native_reports {
+                        for annotation in native.report["uie_constant_analysis"]["annotations"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                        {
+                            let value = annotation["value"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| annotation["value"].to_string());
+                            if !value.to_lowercase().contains(&query)
+                                || self.literal_hits.len() >= 1000
+                            {
+                                continue;
+                            }
+                            let function = native.report["functions"].as_array().and_then(|rows| {
+                                rows.iter()
+                                    .find(|row| row["rva"] == annotation["function_rva"])
+                            });
+                            let problem = function.map(|row| Problem {
+                                file: native.file.clone(),
+                                symbol: row["name"].as_str().unwrap_or("?").into(),
+                                line: row["line"].as_u64().unwrap_or(1) as usize,
+                                message: "constant reference".into(),
+                            });
+                            self.literal_hits.push((
+                                format!(
+                                    "{} · {} · {}",
+                                    native.file.display(),
+                                    annotation["instruction_rva"].as_str().unwrap_or("?"),
+                                    value
+                                ),
+                                problem,
+                            ));
+                        }
+                        for table in native.report["cython_literal_tables"]["tables"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                        {
+                            for entry in table["entries"].as_array().into_iter().flatten() {
+                                let value = entry["text"].as_str().unwrap_or("");
+                                if value.to_lowercase().contains(&query)
+                                    && self.literal_hits.len() < 1000
+                                {
+                                    self.literal_hits.push((
+                                        format!(
+                                            "{} · {} · {}",
+                                            native.file.display(),
+                                            entry["text_rva_hex"].as_str().unwrap_or("?"),
+                                            value
+                                        ),
+                                        None,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let mut selected = None;
+        egui::ScrollArea::vertical()
+            .id_salt("literal-search-results")
+            .max_height(170.0)
+            .show_rows(ui, 18.0, self.literal_hits.len(), |ui, range| {
+                for i in range {
+                    let (text, problem) = &self.literal_hits[i];
+                    if let Some(problem) = problem {
+                        if ui.link(text).clicked() {
+                            selected = Some(problem.clone());
+                        }
+                    } else {
+                        ui.label(text);
+                    }
+                }
+            });
+        if self.literal_hits.len() == 1000 {
+            ui.weak(tr("показаны первые 1000 совпадений"));
+        }
+        if let Some(problem) = selected {
+            self.jump_to_problem(&problem);
+        }
+    }
+    fn xref_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.active else {
+            return;
+        };
+        let Some(stem) = self.documents[active]
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+        else {
+            return;
+        };
+        let Some(address) = stem.strip_prefix("FUN_") else {
+            return;
+        };
+        let Some(output) = self.output.as_ref() else {
+            return;
+        };
+        let body_source = self.documents[active]
+            .path
+            .parent()
+            .and_then(|parent| parent.parent());
+        let mut selected = None;
+        egui::CollapsingHeader::new(tr("прямые вызовы xrefs")).show(ui, |ui| {
+            ui.weak(tr(
+                "кандидаты прямых вызовов — косвенные вызовы не разрешены",
+            ));
+            for native in &self.native_reports {
+                let index = output.join(&native.file);
+                let Some(parent) = index.parent() else {
+                    continue;
+                };
+                let source = if parent.file_name().is_some_and(|name| name == "source") {
+                    parent.to_path_buf()
+                } else {
+                    parent.join("source")
+                };
+                if body_source != Some(source.as_path()) {
+                    continue;
+                }
+                for xref in native.report["call_xrefs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| {
+                        row["target_address"].as_str() == Some(address)
+                            || row["from_address"].as_str() == Some(address)
+                    })
+                    .take(256)
+                {
+                    let target = if xref["target_address"].as_str() == Some(address) {
+                        "from_address"
+                    } else {
+                        "target_address"
+                    };
+                    let label = format!(
+                        "{} → {} · {}",
+                        xref["from_function"].as_str().unwrap_or("?"),
+                        xref["target_function"].as_str().unwrap_or("?"),
+                        xref["instruction_address"].as_str().unwrap_or("?")
+                    );
+                    if ui.link(label).clicked() {
+                        if let Some(function) = native.report["functions"]
+                            .as_array()
+                            .and_then(|rows| rows.iter().find(|row| row["address"] == xref[target]))
+                        {
+                            selected = Some(Problem {
+                                file: native.file.clone(),
+                                symbol: function["name"].as_str().unwrap_or("?").into(),
+                                line: function["line"].as_u64().unwrap_or(1) as usize,
+                                message: "direct call candidate".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(problem) = selected {
+            self.jump_to_problem(&problem);
+        }
+    }
+    fn native_report_panel(&mut self, ui: &mut egui::Ui) {
+        self.literal_search_panel(ui);
+        self.constant_panel(ui, false);
+        let mut selected = None;
+        for native in &self.native_reports {
+            if let Some(methods) = native.report["python_methods"]["methods"]
+                .as_array()
+                .filter(|methods| !methods.is_empty())
+            {
+                egui::CollapsingHeader::new(format!("CPython PyMethodDef ({})", methods.len()))
+                    .id_salt((&native.file, "python-methods"))
+                    .show(ui, |ui| {
+                        ui.weak(tr("метаданные методов не содержат python-байткод"));
+                        egui::ScrollArea::vertical()
+                            .id_salt((&native.file, "python-method-rows"))
+                            .max_height(200.0)
+                            .show_rows(ui, 20.0, methods.len(), |ui, range| {
+                                for index in range {
+                                    let method = &methods[index];
+                                    if ui
+                                        .link(format!(
+                                            "{} · {} · {}",
+                                            method["name"].as_str().unwrap_or("?"),
+                                            method["function_rva_hex"].as_str().unwrap_or("?"),
+                                            method["flags"].as_str().unwrap_or("?")
+                                        ))
+                                        .clicked()
+                                    {
+                                        if let Some(function) = native.report["functions"]
+                                            .as_array()
+                                            .into_iter()
+                                            .flatten()
+                                            .find(|function| {
+                                                function["rva"] == method["function_rva_hex"]
+                                            })
+                                        {
+                                            selected = Some(Problem {
+                                                file: native.file.clone(),
+                                                line: function["line"].as_u64().unwrap_or(1)
+                                                    as usize,
+                                                symbol: method["name"]
+                                                    .as_str()
+                                                    .unwrap_or("?")
+                                                    .into(),
+                                                message: "PyMethodDef entry".into(),
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                    });
+            }
+            if let Some(entries) = native.report["nuitka_modules"]["entries"]
+                .as_array()
+                .filter(|entries| !entries.is_empty())
+            {
+                egui::CollapsingHeader::new(tr("точки входа модулей nuitka"))
+                    .id_salt((&native.file, "nuitka-entries"))
+                    .show(ui, |ui| {
+                        for entry in entries {
+                            if ui
+                                .link(format!(
+                                    "{} · {} · {}",
+                                    entry["name"].as_str().unwrap_or("?"),
+                                    entry["init_rva_hex"].as_str().unwrap_or("?"),
+                                    entry["layout"].as_str().unwrap_or("?")
+                                ))
+                                .clicked()
+                            {
+                                let function = native.report["functions"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .find(|function| function["rva"] == entry["init_rva_hex"]);
+                                if let Some(function) = function {
+                                    selected = Some(Problem {
+                                        file: native.file.clone(),
+                                        line: function["line"].as_u64().unwrap_or(1) as usize,
+                                        symbol: entry["name"].as_str().unwrap_or("?").into(),
+                                        message: tr("точка входа нативного модуля"),
+                                    });
+                                }
+                            }
+                        }
+                    });
+            }
+            if let Some(records) = native.report["cython_recovery"]["records"]
+                .as_array()
+                .filter(|records| !records.is_empty())
+            {
+                egui::CollapsingHeader::new(format!(
+                    "{} ({})",
+                    tr("python имена из traceback"),
+                    records.len()
+                ))
+                .id_salt((&native.file, "cython-symbols"))
+                .show(ui, |ui| {
+                    ui.weak(tr(
+                        "восстановлены имена и места ошибок — тела остаются псевдокодом",
+                    ));
+                    egui::ScrollArea::vertical()
+                        .id_salt((&native.file, "cython-symbol-rows"))
+                        .max_height(220.0)
+                        .show_rows(ui, 20.0, records.len(), |ui, range| {
+                            for index in range {
+                                let record = &records[index];
+                                let name = record["python_name"].as_str().unwrap_or("?");
+                                if ui
+                                    .link(format!(
+                                        "{} · {}",
+                                        name,
+                                        record["native_address"].as_str().unwrap_or("?")
+                                    ))
+                                    .clicked()
+                                {
+                                    let native_name = record["native_name"].as_str().unwrap_or("?");
+                                    selected = Some(Problem {
+                                        file: native.file.clone(),
+                                        line: *native.lines.get(native_name).unwrap_or(&1),
+                                        symbol: name.into(),
+                                        message: tr("python имя из traceback"),
+                                    });
+                                }
+                            }
+                        });
+                });
+            }
             egui::CollapsingHeader::new(format!("native: {}",native.file.display())).default_open(true).show(ui,|ui| {
                 ui.label(tr(&format!("функций: {}; ошибок: {}; исключено CRT / обёрток: {}",native.report["decompiled"],native.report["failed"],native.report["filtered_runtime"])));
                 ui.weak(tr("энтропия и XREF обозначают кандидатов обработки данных; это не доказательство дешифратора"));
@@ -1041,9 +1615,69 @@ impl Toker {
         });
     }
     fn poll(&mut self) {
+        let utility = self.utility_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("operation worker stopped".into())),
+            Err(mpsc::TryRecvError::Empty) => None,
+        });
+        if let Some(result) = utility {
+            self.utility_rx = None;
+            match result {
+                Ok(path) => {
+                    self.status = path.display().to_string();
+                    self.open_document(path);
+                }
+                Err(error) => self.status = error,
+            }
+        }
+        let lazy = self.lazy_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some((PathBuf::new(), Err("lazy decompiler stopped".into())))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        });
+        if let Some((workspace, result)) = lazy {
+            self.lazy_rx = None;
+            self.busy = false;
+            if self.output.as_ref() == Some(&workspace) {
+                match result {
+                    Ok(path) => {
+                        if !self.files.contains(&path) {
+                            self.files.push(path.clone());
+                        }
+                        self.base_dirty = true;
+                        self.open_document(path);
+                        self.scroll_to_line = Some(0);
+                        self.status = tr("функция декомпилирована");
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+        }
+        let restored = self.project_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("project loader stopped; see crash-report.log".into()))
+            }
+        });
+        if let Some(result) = restored {
+            self.project_rx = None;
+            self.busy = false;
+            match result {
+                Ok(restored) if !self.cancel.load(Ordering::Relaxed) => {
+                    self.apply_restored_project(restored)
+                }
+                Ok(_) => self.status = "project loading cancelled".into(),
+                Err(error) => self.status = error,
+            }
+        }
+
         if let Some(loaded) = self.workspace_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.workspace_rx = None;
             self.files = loaded.files;
+            self.literal_hits.clear();
             self.documents = loaded.documents;
             self.active = loaded.active;
             self.native_reports = loaded.native_reports;
@@ -1279,6 +1913,8 @@ impl Toker {
             }
         });
         ui.separator();
+        self.xref_panel(ui);
+        self.constant_panel(ui, true);
         let doc = &mut self.documents[active];
         ui.small(format!(
             "{}  |  {} lines  |  {} bytes",
@@ -1286,35 +1922,14 @@ impl Toker {
             doc.line_starts.len(),
             doc.text.len()
         ));
-        {
-            ui.horizontal(|ui| {
-                ui.weak(tr("код"));
-                if doc.max_columns > 8192 {
-                    ui.weak(tr(
-                        "очень длинные строки показаны до 8192 символов в просмотре",
-                    ));
-                }
-                if ui
-                    .selectable_label(doc.fast_view, tr("быстрый просмотр"))
-                    .clicked()
-                {
-                    doc.fast_view = true;
-                }
-                if ui
-                    .selectable_label(!doc.fast_view, tr("редактировать"))
-                    .clicked()
-                {
-                    doc.fast_view = false;
-                }
-            });
-        }
         let mut scroll = egui::ScrollArea::both()
             .id_salt(("editor", active))
             .auto_shrink([false, false]);
         if let Some(line) = self.scroll_to_line.take() {
             scroll = scroll.vertical_scroll_offset(line as f32 * 15.0);
         }
-        if doc.fast_view {
+        {
+            let mut replacement = None;
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 scroll.show_rows(ui, 15.0, doc.line_starts.len(), |ui, rows| {
@@ -1353,94 +1968,61 @@ impl Toker {
                                         .color(Color32::from_gray(100)),
                                 ),
                             );
-                            let response = ui.add_sized(
-                                [doc.max_columns as f32 * 7.9, 15.0],
-                                egui::Label::new(job).sense(egui::Sense::click()),
-                            );
-                            if response.clicked() {
-                                let column = response
-                                    .interact_pointer_pos()
-                                    .map(|p| ((p.x - response.rect.left()) / 7.9).max(0.0) as usize)
-                                    .unwrap_or(0);
-                                response.request_focus();
+                            let original = doc.text[start..end].trim_end_matches(['\r', '\n']);
+                            let editable = original.chars().nth(8192).is_none();
+                            let mut edited = if editable {
+                                original.to_string()
+                            } else {
+                                String::new()
+                            };
+                            let response = if editable {
+                                let mut layouter = |ui: &egui::Ui, text: &str, _: f32| {
+                                    ui.fonts(|fonts| fonts.layout_job(highlight(text)))
+                                };
+                                ui.add_sized(
+                                    [doc.max_columns.max(80) as f32 * 7.9, 15.0],
+                                    egui::TextEdit::multiline(&mut edited)
+                                        .id_salt(("uie-line", &doc.path, line))
+                                        .font(egui::FontId::monospace(13.0))
+                                        .margin(egui::Vec2::ZERO)
+                                        .frame(false)
+                                        .lock_focus(true)
+                                        .code_editor()
+                                        .desired_rows(1)
+                                        .layouter(&mut layouter),
+                                )
+                            } else {
+                                ui.add_sized(
+                                    [doc.max_columns.min(8192) as f32 * 7.9, 15.0],
+                                    egui::Label::new(job).sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(tr(
+                                    "строка слишком длинная для встроенного редактирования",
+                                ))
+                            };
+                            if response.has_focus() || response.clicked() {
                                 self.editor_focused = true;
-                                self.editor_character = doc.text[..start].chars().count()
-                                    + column.min(doc.text[start..end].chars().count());
+                                let cursor = egui::TextEdit::load_state(ui.ctx(), response.id)
+                                    .and_then(|state| state.cursor.char_range())
+                                    .map(|range| range.primary.index)
+                                    .unwrap_or(0);
+                                self.editor_character = doc.text[..start].chars().count() + cursor;
+                            }
+                            if response.changed() {
+                                replacement = Some((start, start + original.len(), edited));
                             }
                         });
                     }
                 });
             });
-            return;
+            if let Some((start, end, edited)) = replacement {
+                doc.text.replace_range(start..end, &edited);
+                doc.dirty = true;
+                doc.reindex();
+                self.base_dirty = true;
+            }
+            self.cursor_line = None;
         }
-        let cursor_line = self.cursor_line.take();
-        let viewed = scroll.show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&doc.numbers)
-                            .monospace()
-                            .size(13.0)
-                            .color(Color32::from_gray(90)),
-                    )
-                    .selectable(false),
-                );
-                let mut layouter = |ui: &egui::Ui, text: &str, _width: f32| {
-                    if doc.galley_len != text.len() {
-                        doc.galley = None;
-                        doc.galley_len = text.len();
-                    }
-                    doc.galley
-                        .get_or_insert_with(|| ui.fonts(|fonts| fonts.layout_job(highlight(text))))
-                        .clone()
-                };
-                let editor_id = ui.make_persistent_id(("uie-code", &doc.path));
-                if let Some(line) = cursor_line {
-                    let offset = doc
-                        .text
-                        .split_inclusive('\n')
-                        .take(line)
-                        .map(|s| s.chars().count())
-                        .sum();
-                    let mut state =
-                        egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
-                    state
-                        .cursor
-                        .set_char_range(Some(egui::text::CCursorRange::one(
-                            egui::text::CCursor::new(offset),
-                        )));
-                    state.store(ui.ctx(), editor_id);
-                }
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut doc.text)
-                        .id(editor_id)
-                        .code_editor()
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(40)
-                        .lock_focus(true)
-                        .layouter(&mut layouter),
-                );
-                if let Some(range) = egui::TextEdit::load_state(ui.ctx(), editor_id)
-                    .and_then(|s| s.cursor.char_range())
-                {
-                    self.editor_character = range.primary.index;
-                }
-                if cursor_line.is_some() {
-                    response.request_focus();
-                }
-                self.editor_focused = response.has_focus();
-                if response.changed() {
-                    doc.dirty = true;
-                    doc.reindex();
-                    self.base_dirty = true;
-                }
-            });
-        });
-        self.visible_lines = (
-            (viewed.state.offset.y / 15.0) as usize,
-            ((viewed.state.offset.y + viewed.inner_rect.height()) / 15.0) as usize,
-        );
     }
 }
 
@@ -1541,7 +2123,7 @@ impl Toker {
         };
         let doc = &self.documents[index];
         let character = self.editor_character;
-        self.rename_from = crate::rename::symbol_at(&doc.text, character);
+        self.rename_from = crate::rename::symbol_at(&doc.text, character, &doc.path);
         self.rename_to.clear();
         self.rename_open = true;
     }
@@ -1549,6 +2131,10 @@ impl Toker {
         if !self.rename_open {
             return;
         }
+        let rename_path = self
+            .active
+            .map(|index| self.documents[index].path.clone())
+            .unwrap_or_default();
         let mut open = true;
         egui::Window::new(tr("переименовать"))
             .id(egui::Id::new("rename-dialog"))
@@ -1568,8 +2154,8 @@ impl Toker {
                 });
                 if ui
                     .add_enabled(
-                        crate::rename::valid(&self.rename_from)
-                            && crate::rename::valid(&self.rename_to)
+                        crate::rename::valid(&self.rename_from, &rename_path)
+                            && crate::rename::valid(&self.rename_to, &rename_path)
                             && self.rename_from != self.rename_to,
                         egui::Button::new(tr("применить")),
                     )
@@ -1580,6 +2166,7 @@ impl Toker {
                             &self.documents[index].text,
                             &self.rename_from,
                             &self.rename_to,
+                            &self.documents[index].path,
                         ) {
                             Ok((text, count)) if count > 0 => {
                                 let doc = &mut self.documents[index];
@@ -1879,7 +2466,10 @@ impl eframe::App for Toker {
         }
         if self.busy
             || self.workspace_rx.is_some()
+            || self.project_rx.is_some()
             || self.document_rx.is_some()
+            || self.lazy_rx.is_some()
+            || self.utility_rx.is_some()
             || self.debugger_rx.is_some()
             || self.update_rx.is_some()
         {
@@ -2010,6 +2600,7 @@ impl eframe::App for Toker {
                 ui.label(tr(&self.status));
             });
         });
+        let mut lazy_requested = None;
         egui::SidePanel::left("navigation")
             .default_width(250.0)
             .min_width(190.0)
@@ -2026,6 +2617,23 @@ impl eframe::App for Toker {
                 ui.separator();
                 ui.add_enabled_ui(!self.busy, |ui| {
                     ui.checkbox(&mut self.settings.all_modules, tr("включая все модули"));
+                    if ui
+                        .checkbox(
+                            &mut self.settings.lazy_native,
+                            tr("ленивая декомпиляция native"),
+                        )
+                        .changed()
+                    {
+                        let _ = self.settings.save();
+                    }
+                });
+                ui.add_enabled_ui(!self.busy && self.utility_rx.is_none(), |ui| {
+                    if ui.button(tr("экспорт символов x64dbg")).clicked() {
+                        self.export_debugger_symbols();
+                    }
+                    if ui.button(tr("сравнить две базы")).clicked() {
+                        self.compare_bases();
+                    }
                 });
                 ui.separator();
                 ui.label(tr("исходники"));
@@ -2082,6 +2690,10 @@ impl eframe::App for Toker {
                                             for row in range {
                                                 let (line, symbol, _) = rows[row];
                                                 if ui.selectable_label(false, symbol).clicked() {
+                                                    lazy_requested = Some((
+                                                        self.documents[index].path.clone(),
+                                                        *line,
+                                                    ));
                                                     self.scroll_to_line = Some(*line);
                                                     self.cursor_line = Some(*line);
                                                     self.tab = 0;
@@ -2108,6 +2720,9 @@ impl eframe::App for Toker {
                         });
                 }
             });
+        if let Some((path, line)) = lazy_requested {
+            self.request_lazy(path, line);
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for (index, name) in [tr("код"), tr("этапы"), tr("отчёт"), tr("лог")]
@@ -2200,6 +2815,85 @@ impl Drop for Toker {
 mod tests {
     use super::*;
     #[test]
+    fn project_verification_and_document_loading_run_off_the_ui_thread() {
+        let context = egui::Context::default();
+        let avatar = context.load_texture(
+            "project-loader-test",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        let root = std::env::temp_dir().join(format!("uie-project-worker-{}", std::process::id()));
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::write(
+            root.join("source/main.py"),
+            "def sample():\n    return 42\n".repeat(10000),
+        )
+        .unwrap();
+        let analysis = crate::detect::inspect(b"owned fixture").unwrap();
+        let project = crate::project::capture("fixture", &root, false, &analysis).unwrap();
+        let file = root.join("project.toker");
+        fs::write(&file, serde_json::to_vec(&project).unwrap()).unwrap();
+        app.restore_project(file);
+        assert!(app.project_rx.is_some());
+        assert!(app.busy);
+        assert!(app.documents.is_empty());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.project_rx.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.project_rx.is_none());
+        assert!(!app.busy);
+        assert!(app.active.is_some());
+        assert!(app.documents[0].text.contains("return 42"));
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn decoded_string_annotations_are_drawn_next_to_the_containing_function() {
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let avatar = context.load_texture(
+            "constant-test",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        let output = std::env::temp_dir().join("uie-constant-display");
+        let file = PathBuf::from("fixture_decompiled.c");
+        app.output = Some(output.clone());
+        app.documents.push(Document::new(
+            output.join(&file),
+            "void sample(void) {}\n".into(),
+        ));
+        app.active = Some(0);
+        app.native_reports.push(NativeReport { file, lines: HashMap::new(), report: serde_json::json!({
+            "functions":[{"name":"sample","rva":"0x1000","line":1}],
+            "uie_constant_analysis":{"annotations":[{"kind":"string_candidate","function_rva":"0x1000","instruction_rva":"0x1020","location":"stack-0x20","value":"HELLO"}]}
+        }) });
+        let mut drawn = false;
+        for _ in 0..3 {
+            let result = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.editor(ui));
+                },
+            );
+            drawn |= result.shapes.iter().any(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => text.galley.text().contains("HELLO"),
+                _ => false,
+            });
+        }
+        assert!(drawn);
+    }
+    #[test]
     fn code_tab_shortcut_does_not_reenter_context_lock() {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -2255,7 +2949,49 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(app.active.is_some());
-        assert!(app.documents[0].fast_view);
+        assert!(!app.documents[0].line_starts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn lazy_symbol_selection_opens_cached_body_without_blocking_ui() {
+        let context = egui::Context::default();
+        let avatar = context.load_texture(
+            "lazy-test",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        let root = std::env::temp_dir().join(format!("uie-lazy-ui-{}", std::process::id()));
+        fs::create_dir_all(root.join("source/functions")).unwrap();
+        let index = root.join("sample_decompiled.c");
+        fs::write(&index, "/* Function at 180001000: sample */\n").unwrap();
+        let body = root.join("source/functions/FUN_180001000.c");
+        fs::write(&body, "int sample(void) { return 7; }\n").unwrap();
+        let report =
+            serde_json::json!({"lazy":true,"functions":[{"address":"180001000","line":1}]});
+        fs::write(
+            root.join("native-report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        app.output = Some(root.clone());
+        app.native_reports.push(NativeReport {
+            file: "sample_decompiled.c".into(),
+            report,
+            lines: HashMap::new(),
+        });
+        app.request_lazy(index, 0);
+        assert!(app.busy && app.lazy_rx.is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (app.lazy_rx.is_some() || app.document_rx.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.busy);
+        assert_eq!(app.documents[app.active.unwrap()].path, body);
+        assert!(app.base_dirty);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2358,7 +3094,7 @@ mod tests {
             });
         }
         let doc = &app.documents[0];
-        assert!(doc.fast_view);
+        assert!(!doc.line_starts.is_empty());
         assert_eq!(doc.text.len(), expected);
         assert!(doc.line_cache.len() < 300);
         assert!(doc.line_cache.keys().any(|line| *line >= 35000));

@@ -21,6 +21,18 @@ const REPORTS: &[&str] = &[
     "objects-report.json",
     "python-report.json",
     "native-report.json",
+    "analysis-profile.json",
+    "native-lift-report.json",
+    "native-constants-report.json",
+    "native-tables-report.json",
+    "nuitka-modules-report.json",
+    "python-methods-report.json",
+    "python-api-types.json",
+    "cython-strings-report.json",
+    "cython-slots-report.json",
+    "raw-native-pseudocode.txt",
+    "unpack-report.json",
+    "packed-analysis.json",
     "uie-session.json",
     "uie-session.log",
     "equivalence.json",
@@ -34,39 +46,22 @@ fn safe_relative(path: &Path) -> bool {
 
 pub fn export(path: &Path, project: &Project) -> Result<(), String> {
     let mut files = BTreeMap::new();
-    let mut folders = vec![project.output.join("source")];
     let mut size = 0;
-    while let Some(folder) = folders.pop() {
-        if let Ok(entries) = fs::read_dir(folder) {
-            for entry in entries {
-                let entry = entry.map_err(|e| e.to_string())?;
-                let kind = entry.file_type().map_err(|e| e.to_string())?;
-                if kind.is_dir() {
-                    folders.push(entry.path());
-                } else if kind.is_file() && !crate::telemetry::is_base(&entry.path()) {
-                    let relative = entry
-                        .path()
-                        .strip_prefix(&project.output)
-                        .map_err(|e| e.to_string())?
-                        .to_path_buf();
-                    add_file(&mut files, relative, &entry.path(), &mut size)?;
-                }
-            }
-        }
+    let actual_sources = project::source_hashes(&project.output)?;
+    let source_set_changed = actual_sources != project.source_sha256;
+    for relative in actual_sources.into_keys() {
+        add_file(
+            &mut files,
+            relative.clone(),
+            &project.output.join(relative),
+            &mut size,
+        )?;
     }
     for name in REPORTS {
         let file = project.output.join(name);
-        if file.is_file() {
+        if file.is_file() && !files.contains_key(Path::new(name)) {
             add_file(&mut files, PathBuf::from(name), &file, &mut size)?;
         }
-    }
-    if let Some(file) = project::native_source(&project.output) {
-        add_file(
-            &mut files,
-            file.file_name().unwrap().into(),
-            &file,
-            &mut size,
-        )?;
     }
     if files.is_empty() {
         return Err("нет файлов для базы".into());
@@ -74,7 +69,7 @@ pub fn export(path: &Path, project: &Project) -> Result<(), String> {
     let mut manifest = serde_json::to_value(project).map_err(|e| e.to_string())?;
     manifest["output"] = serde_json::json!(".");
     let mut hashes = BTreeMap::new();
-    let mut changed = false;
+    let mut changed = source_set_changed;
     for (relative, bytes) in &files {
         if relative.starts_with("source") || relative.extension().is_some_and(|e| e == "c") {
             let hash = format!("{:x}", Sha256::digest(bytes));
