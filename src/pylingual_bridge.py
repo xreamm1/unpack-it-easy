@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import re
 import sys
+from model_download import install as install_downloads
 
 
 def emit(kind, **fields):
@@ -43,6 +44,7 @@ def main():
     parser.add_argument('--output-prefix', type=Path, default=Path(''))
     parser.add_argument('input', type=Path)
     args = parser.parse_args()
+    install_downloads()
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(levelname)s %(message)s', force=True)
     emit('progress', phase='загрузка движка и моделей', file='', done=0, total=0)
     from pylingual.decompiler import Decompiler, decompile

@@ -1,18 +1,21 @@
-import ghidra.app.script.GhidraScript;
+import ghidra.app.util.headless.HeadlessScript;
 import ghidra.app.decompiler.*;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.address.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.symbol.*;
+import ghidra.program.model.data.*;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.*;
 
-public class UieExport extends GhidraScript {
+public class UieExport extends HeadlessScript {
     private static final int TIMEOUT = FUNCTION_TIMEOUT;
+    private static final int DECOMPILER_WORKERS = 2;
     private static final int ENTROPY_WINDOW = 65536;
     private static final int WINDOWS_PER_SECTION = 8;
     private static final double ENTROPY_THRESHOLD = 7.2;
@@ -25,6 +28,28 @@ public class UieExport extends GhidraScript {
     private int line = 1;
     private BufferedWriter writer;
 
+    private static class Decompiled {
+        final DecompileResults result;
+        final boolean retried;
+        Decompiled(DecompileResults result,boolean retried){this.result=result;this.retried=retried;}
+    }
+    private Decompiled decompile(DecompInterface decompiler,Function function) {
+        DecompileResults result=decompiler.decompileFunction(function,TIMEOUT,monitor);
+        boolean good=result.decompileCompleted()&&result.getDecompiledFunction()!=null;
+        boolean retried=false;
+        if(!good&&!monitor.isCancelled()){
+            retried=true;
+            DecompileOptions conservative=new DecompileOptions();
+            conservative.setEliminateUnreachable(false);conservative.setRespectReadOnly(false);conservative.setPredicate(false);
+            decompiler.setOptions(conservative);decompiler.flushCache();
+            try {
+                DecompileResults retry=decompiler.decompileFunction(function,TIMEOUT,monitor);
+                if(retry.decompileCompleted()&&retry.getDecompiledFunction()!=null)result=retry;
+            } finally {decompiler.setOptions(new DecompileOptions());decompiler.flushCache();}
+        }
+        return new Decompiled(result,retried);
+    }
+
     private boolean matches(String name, String[] markers) {
         for (String marker : markers) if (name.contains(marker)) return true;
         return false;
@@ -34,6 +59,10 @@ public class UieExport extends GhidraScript {
     private boolean runtime(Function function) {
         if (user(function) || initializer(function)) return false;
         if (function.isExternal() || function.isThunk()) return true;
+        BookmarkManager bookmarks=currentProgram.getBookmarkManager();
+        Bookmark fid=bookmarks.getBookmark(function.getEntryPoint(),BookmarkType.ANALYSIS,"Function ID Analyzer");
+        if(fid!=null&&fid.getComment()!=null&&fid.getComment().startsWith("Library Function - Single Match, ")
+            &&bookmarks.getBookmark(function.getEntryPoint(),BookmarkType.ANALYSIS,"Function ID Conflict")==null)return true;
         String name = function.getSymbol().getName(true);
         if (CRT_NAMES.contains(name)) return true;
         for (String prefix : CRT_PREFIXES) if (name.startsWith(prefix)) return true;
@@ -43,6 +72,10 @@ public class UieExport extends GhidraScript {
         Map<String,Object> result = new LinkedHashMap<>();
         for (int i=0; i<fields.length; i+=2) result.put(fields[i].toString(),fields[i+1]);
         return result;
+    }
+    private void event(Map<String,Object> value) throws IOException {
+        System.out.write(("UIE_EVENT "+json.toJson(value)+"\n").getBytes(StandardCharsets.UTF_8));
+        System.out.flush();
     }
     private String rva(Address address) { return "0x" + Long.toHexString(address.subtract(currentProgram.getImageBase())); }
     private void write(String text) throws IOException {
@@ -61,10 +94,85 @@ public class UieExport extends GhidraScript {
         if (initializer(function)) return 1;
         return candidates.contains(function.getEntryPoint()) ? 2 : 3;
     }
+    private List<Map<String,Object>> applyPythonMethodHints() {
+        List<Map<String,Object>> applied=new ArrayList<>();
+        if(getScriptArgs().length<4||!Files.isRegularFile(Paths.get(getScriptArgs()[3])))return applied;
+        boolean pythonExtension=false;
+        FunctionIterator existing=currentProgram.getFunctionManager().getFunctions(true);
+        while(existing.hasNext())if(existing.next().getName().startsWith("PyInit_")){pythonExtension=true;break;}
+        if(!pythonExtension||currentProgram.getDefaultPointerSize()!=8)return applied;
+        try {
+            Map<?,?> metadata=json.fromJson(Files.readString(Paths.get(getScriptArgs()[3]),StandardCharsets.UTF_8),Map.class);
+            Object methods=metadata.get("methods");if(!(methods instanceof List<?>))return applied;
+            Map<String,String> abiByRva=new HashMap<>();Set<String> conflicting=new HashSet<>();
+            for(Object item:(List<?>)methods)if(item instanceof Map<?,?>){
+                Map<?,?> method=(Map<?,?>)item;String rvaText=String.valueOf(method.get("function_rva_hex"));String flags=String.valueOf(method.get("flags"));
+                String previous=abiByRva.putIfAbsent(rvaText,flags);if(previous!=null&&!previous.equals(flags))conflicting.add(rvaText);
+            }
+            DataType objectType=currentProgram.getDataTypeManager().getDataType("/UIE/CPython312Win64/PyObject312");
+            DataType objectPointer=new PointerDataType(objectType==null?VoidDataType.dataType:objectType,currentProgram.getDataTypeManager());
+            DataType argumentArray=new PointerDataType(objectPointer);
+            for(Object item:(List<?>)methods){
+                if(!(item instanceof Map<?,?>)||applied.size()>=4096)continue;
+                Map<?,?> method=(Map<?,?>)item;
+                String rvaText=String.valueOf(method.get("function_rva_hex"));
+                if(conflicting.contains(rvaText))continue;
+                if(!rvaText.matches("0x[0-9a-fA-F]{1,8}"))continue;
+                int flags=Integer.decode(String.valueOf(method.get("flags")));int base=flags&~0x70;
+                if(!(base==1||base==3||base==4||base==8||base==128||base==130||base==642))continue;
+                Address address=currentProgram.getImageBase().add(Long.parseUnsignedLong(rvaText.substring(2),16));
+                Function function=getFunctionAt(address);
+                if(function==null&&getFunctionContaining(address)==null){
+                    disassemble(address);
+                    function=createFunction(address,null);
+                }
+                if(function==null)continue;
+                SourceType signature=function.getSignatureSource();
+                if(signature==SourceType.USER_DEFINED||signature==SourceType.IMPORTED)continue;
+                List<ParameterImpl> params=new ArrayList<>();
+                params.add(new ParameterImpl("self",objectPointer,currentProgram));
+                if(base==642)params.add(new ParameterImpl("defining_class",objectPointer,currentProgram));
+                if(base==128||base==130||base==642){
+                    params.add(new ParameterImpl("args",argumentArray,currentProgram));
+                    params.add(new ParameterImpl("nargs",LongLongDataType.dataType,currentProgram));
+                    if(base!=128)params.add(new ParameterImpl("kwnames",objectPointer,currentProgram));
+                }else{
+                    params.add(new ParameterImpl(base==8?"arg":base==4?"unused":"args",objectPointer,currentProgram));
+                    if(base==3)params.add(new ParameterImpl("kwargs",objectPointer,currentProgram));
+                }
+                function.updateFunction(null,new ReturnParameterImpl(objectPointer,currentProgram),params,Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,true,SourceType.ANALYSIS);
+                String name=String.valueOf(method.get("name"));
+                if(function.getName().startsWith("FUN_"))function.setName("py_method_"+name.replaceAll("[^A-Za-z0-9_]","_")+"_"+rvaText.substring(2),SourceType.ANALYSIS);
+                applied.add(row("name",name,"rva",rvaText,"flags",String.valueOf(method.get("flags")),"parameters",params.size(),"interpretation","CPython C-callable ABI from method flags; not original Python signature"));
+            }
+        }catch(Exception error){println("UIE Python ABI hints: "+error.getMessage());}
+        return applied;
+    }
 
     @Override public void run() throws Exception {
         Path output = Paths.get(getScriptArgs()[0]);
         String source = getScriptArgs().length>1 ? getScriptArgs()[1] : output.getFileName().toString();
+        boolean lazy=getScriptArgs().length>4&&getScriptArgs()[4].equals("index");
+        List<Map<String,Object>> pythonMethodHints=applyPythonMethodHints();
+        if (getScriptArgs().length>2 && Files.isRegularFile(Paths.get(getScriptArgs()[2]))) {
+            try {
+                Map<?,?> metadata=json.fromJson(Files.readString(Paths.get(getScriptArgs()[2]),StandardCharsets.UTF_8),Map.class);
+                Object entries=metadata.get("entries");
+                if(entries instanceof List<?>) for(Object item:(List<?>)entries) {
+                    if(!(item instanceof Map<?,?>)) continue;
+                    Map<?,?> entry=(Map<?,?>)item;
+                    String name=String.valueOf(entry.get("name"));
+                    String rvaText=String.valueOf(entry.get("init_rva_hex"));
+                    if(!name.matches("[A-Za-z_][A-Za-z0-9_.]{0,255}")||!rvaText.matches("0x[0-9a-fA-F]{1,8}"))continue;
+                    Address address=currentProgram.getImageBase().add(Long.parseUnsignedLong(rvaText.substring(2),16));
+                    Function function=getFunctionAt(address);
+                    if(function!=null&&(function.getSymbol().getSource()==SourceType.DEFAULT||function.getName().startsWith("FUN_"))) {
+                        function.setName("modulecode_"+name.replace('.','_'),SourceType.ANALYSIS);
+                        println("UIE Nuitka entry: "+name+" RVA "+rvaText);
+                    }
+                }
+            } catch(Exception error) { println("UIE Nuitka metadata not applied: "+error.getMessage()); }
+        }
         List<Map<String,Object>> sections = new ArrayList<>();
         List<Map<String,Object>> highEntropy = new ArrayList<>();
         List<Map<String,Object>> references = new ArrayList<>();
@@ -113,6 +221,24 @@ public class UieExport extends GhidraScript {
             else queue.add(function);
         }
         queue.sort(Comparator.comparingInt((Function f)->priority(f,candidates)).thenComparing(Function::getEntryPoint));
+        if(lazy){
+            List<Map<String,Object>> functions=new ArrayList<>();
+            try(BufferedWriter opened=Files.newBufferedWriter(output,StandardCharsets.UTF_8)){
+                writer=opened;
+                write("/* UIE native function index. Select a function to decompile it on demand. */\n");
+                for(Function function:queue){
+                    if(monitor.isCancelled())throw new IOException("Cancelled");
+                    String name=function.getSymbol().getName(true);
+                    int firstLine=line+1;
+                    write("\n/* Function at "+function.getEntryPoint()+": "+name.replace("*/","* /")+" */\n");
+                    functions.add(row("name",name,"address",function.getEntryPoint().toString(),"end",function.getBody().getMaxAddress().add(1).toString(),"rva",rva(function.getEntryPoint()),"line",firstLine,"group",user(function)?"user":initializer(function)?"constants":"other","success",false,"lazy",true));
+                }
+            }
+            Map<String,Object> report=row("source_file",output.getFileName().toString(),"decompiled",0,"failed",0,"lazy",true,"indexed",functions.size(),"functions",functions,"filtered_runtime",skipped.size(),"skipped_functions",skipped,"sections",sections,"high_entropy_sections",highEntropy,"constant_data_xrefs",references,"python_method_abi_hints",pythonMethodHints);
+            Files.writeString(output.resolveSibling("native-report.json"),new GsonBuilder().setPrettyPrinting().create().toJson(report),StandardCharsets.UTF_8);
+            event(row("kind","progress","phase","native function index ready","file",source,"done",queue.size(),"total",queue.size()));
+            return;
+        }
         List<Map<String,Object>> pythonStrings=new ArrayList<>();
         DataIterator defined=currentProgram.getListing().getDefinedData(true);
         while(defined.hasNext()&&pythonStrings.size()<1024&&!monitor.isCancelled()){
@@ -126,28 +252,41 @@ public class UieExport extends GhidraScript {
             pythonStrings.add(row("value",text,"address",data.getAddress().toString(),"rva",rva(data.getAddress()),"references",incoming));
         }
         queue.sort(Comparator.comparingInt((Function f)->priority(f,candidates)).thenComparing(Function::getEntryPoint));
-        DecompInterface decompiler=new DecompInterface();
+        List<DecompInterface> decompilers=new ArrayList<>();
+        BlockingQueue<DecompInterface> available=new ArrayBlockingQueue<>(DECOMPILER_WORKERS);
+        ExecutorService executor=Executors.newFixedThreadPool(DECOMPILER_WORKERS);
+        Deque<Future<Decompiled>> pending=new ArrayDeque<>();
         List<Map<String,Object>> functions=new ArrayList<>(); List<Map<String,Object>> initializers=new ArrayList<>();
         int success=0,failed=0,processed=0;
+        boolean analysisTimedOut=analysisTimeoutOccurred();
         try (BufferedWriter opened=Files.newBufferedWriter(output,StandardCharsets.UTF_8)) {
             writer=opened;
-            if (!decompiler.openProgram(currentProgram)) throw new IOException("Cannot open program");
+            for(int i=0;i<DECOMPILER_WORKERS;i++){
+                DecompInterface worker=new DecompInterface();decompilers.add(worker);
+                if(!worker.openProgram(currentProgram))throw new IOException("Cannot open program");
+                available.add(worker);
+            }
+            int scheduled=0;
             write("/* UIE / Ghidra pseudocode. Runtime filtering uses names and thunk metadata. */\n");
             for (Function function : queue) {
                 if (monitor.isCancelled()) break;
+                while(scheduled<queue.size()&&pending.size()<DECOMPILER_WORKERS){
+                    Function next=queue.get(scheduled++);
+                    pending.add(executor.submit(()->{
+                        DecompInterface worker=available.take();
+                        try{return decompile(worker,next);}finally{available.add(worker);}
+                    }));
+                }
                 int firstLine=line+1;
                 String name=function.getSymbol().getName(true);
                 write("\n/* Function at "+function.getEntryPoint()+": "+name.replace("*/","* /")+" */\n");
-                DecompileResults result=decompiler.decompileFunction(function,TIMEOUT,monitor);
+                writer.flush();
+                event(row("kind","progress","phase","decompiling "+name,"file",source,"done",processed,"total",queue.size()));
+                System.out.flush();
+                Decompiled completed=pending.removeFirst().get();
+                DecompileResults result=completed.result;
                 boolean good=result.decompileCompleted()&&result.getDecompiledFunction()!=null;
-                boolean retried=false;
-                if(!good&&!monitor.isCancelled()){
-                    retried=true;DecompileOptions conservative=new DecompileOptions();conservative.setEliminateUnreachable(false);conservative.setRespectReadOnly(false);conservative.setPredicate(false);
-                    decompiler.setOptions(conservative);decompiler.flushCache();
-                    DecompileResults retry=decompiler.decompileFunction(function,TIMEOUT,monitor);
-                    if(retry.decompileCompleted()&&retry.getDecompiledFunction()!=null){result=retry;good=true;}
-                    decompiler.setOptions(new DecompileOptions());decompiler.flushCache();
-                }
+                boolean retried=completed.retried;
                 if (good) { write(result.getDecompiledFunction().getC()); success++; }
                 else {
                     write("/* decompilation failed: "+result.getErrorMessage().replace("*/","* /")+"\n");
@@ -157,7 +296,7 @@ public class UieExport extends GhidraScript {
                         write(instruction.getAddress()+"  "+instruction.toString().replace("*/","* /")+"\n");
                     }
                     write("*/\n"); failed++;
-                    println("UIE_EVENT "+json.toJson(row("kind","problem","file",source,"symbol",name,"line",firstLine,"message",result.getErrorMessage())));
+                    event(row("kind","problem","file",source,"symbol",name,"line",firstLine,"message",result.getErrorMessage()));
                 }
                 Map<String,Object> record=row("name",name,"address",function.getEntryPoint().toString(),"rva",rva(function.getEntryPoint()),"line",firstLine,"group",user(function)?"user":initializer(function)?"constants":"other","success",good,"retried",retried,"error",good?"":result.getErrorMessage(),"fallback",good?"":"disassembly");
                 functions.add(record);
@@ -166,11 +305,23 @@ public class UieExport extends GhidraScript {
                     while (incoming.hasNext()&&callers.size()<128) { Reference reference=incoming.next(); Function caller=getFunctionContaining(reference.getFromAddress()); callers.add(row("from",reference.getFromAddress().toString(),"caller",caller==null?"":caller.getSymbol().getName(true))); }
                     initializers.add(row("function",name,"address",function.getEntryPoint().toString(),"rva",rva(function.getEntryPoint()),"line",firstLine,"callers",callers));
                 }
+                writer.flush();
                 processed++;
-                println("UIE_EVENT "+json.toJson(row("kind","progress","phase","декомпиляция функций","file",source,"done",processed,"total",queue.size())));
+                event(row("kind","progress","phase","function decompilation","file",source,"done",processed,"total",queue.size()));
+                System.out.flush();
             }
-        } finally { decompiler.dispose(); }
+        } finally {
+            executor.shutdownNow();
+            for(DecompInterface worker:decompilers)worker.stopProcess();
+            executor.awaitTermination(5,TimeUnit.SECONDS);
+            for(DecompInterface worker:decompilers)worker.dispose();
+        }
         Map<String,Object> report=row("source_file",output.getFileName().toString(),"decompiled",success,"failed",failed,"filtered_runtime",skipped.size(),"skipped_functions",skipped,"functions",functions,"constant_initializers",initializers,"sections",sections,"high_entropy_sections",highEntropy,"constant_data_xrefs",references,"python_string_references",pythonStrings,"xrefs_truncated",limited,"entropy_threshold",ENTROPY_THRESHOLD,"interpretation","Entropy and XREFs identify candidate constant/data-processing sites. Nuitka Commercial and encryption are not proven by entropy alone.");
+        report.put("python_method_abi_hints",pythonMethodHints);
+        report.put("analysis_timed_out",analysisTimedOut);
+        report.put("pending_functions",queue.size()-processed);
+        report.put("function_timeout_seconds",TIMEOUT);
+        report.put("decompiler_workers",DECOMPILER_WORKERS);
         Files.write(output.resolveSibling("native-report.json"),new GsonBuilder().setPrettyPrinting().create().toJson(report).getBytes(StandardCharsets.UTF_8));
         println("UIE native result: "+success+" functions, "+failed+" failures, "+skipped.size()+" runtime functions filtered");
     }

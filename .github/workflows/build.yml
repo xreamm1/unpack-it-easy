@@ -1,26 +1,44 @@
-name: Windows checks
+name: Desktop checks
 on: [push, pull_request]
 jobs:
-  check:
-    runs-on: windows-latest
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: UIE-windows-x64
+            binary: target/release/UIE.exe
+          - os: ubuntu-latest
+            artifact: UIE-linux-x64
+            binary: target/release/UIE
+          - os: macos-15
+            artifact: UIE-macos-arm64
+            binary: target/release/UIE
+          - os: macos-15-intel
+            artifact: UIE-macos-x64
+            binary: target/release/UIE
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libx11-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - uses: actions/upload-artifact@v4
+      - if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.artifact }}.tar.gz -C target/release UIE
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
         with:
-          name: UIE-windows-x64
-          path: target/release/UIE.exe
-
-  linux-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libx11-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev
-      - run: cargo check --locked
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+      - if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz

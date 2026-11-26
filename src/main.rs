@@ -1,19 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod about;
 mod archives;
+mod cython;
+mod cython_slots;
 mod database;
 mod debugger;
+mod debugger_export;
 mod detect;
 mod diagnostics;
 mod engine;
 mod indicators;
 mod language;
+mod native_index;
+mod native_lift;
 mod project;
+mod project_diff;
 mod rename;
+mod retdec;
 mod runtime;
 mod telemetry;
 mod triage;
 mod ui;
+mod unpack;
 mod updater;
 use engine::{Event, Settings};
 use std::{
@@ -90,6 +98,67 @@ fn headless(args: &[std::ffi::OsString]) -> i32 {
 fn main() -> eframe::Result<()> {
     diagnostics::install_hook();
     let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--decompile-function") {
+        if args.len() != 5 {
+            std::process::exit(2);
+        }
+        let result = (|| -> Result<PathBuf, String> {
+            let settings: Settings =
+                serde_json::from_slice(&fs::read(&args[4]).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let root = Path::new(&args[2])
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            engine::lazy_function(settings, &root, &args[3].to_string_lossy())
+        })();
+        if let Err(error) = &result {
+            let _ = fs::write(Path::new(&args[2]).join("lazy-error.log"), error);
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if args.get(1).is_some_and(|a| a == "--unpack") {
+        if args.len() != 4 {
+            std::process::exit(2);
+        }
+        let (tx, _rx) = mpsc::channel();
+        let result = (|| -> Result<(), String> {
+            let input = Path::new(&args[2])
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let output = Path::new(&args[3]);
+            fs::create_dir_all(output).map_err(|e| e.to_string())?;
+            let output = output.canonicalize().map_err(|e| e.to_string())?;
+            let analysis = detect::inspect_file(&input)?;
+            unpack::automatic(
+                &input,
+                &analysis,
+                &output,
+                Settings::load().offline,
+                &AtomicBool::new(false),
+                &tx,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            let _ = fs::write(Path::new(&args[3]).join("unpack-error.log"), error);
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if args.get(1).is_some_and(|a| a == "--lift-native") {
+        if args.len() != 4 {
+            std::process::exit(2);
+        }
+        let result = native_lift::analyze(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            &AtomicBool::new(false),
+        );
+        if let Err(error) = &result {
+            let _ = fs::create_dir_all(Path::new(&args[3]));
+            let _ = fs::write(Path::new(&args[3]).join("native-lift-error.log"), error);
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if args.get(1).is_some_and(|a| a == "--prepare-debugger") {
         let result = debugger::prepare("x64", Settings::load().offline);
         std::process::exit(if result.is_ok() { 0 } else { 1 });

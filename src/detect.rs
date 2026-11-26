@@ -171,6 +171,12 @@ pub fn inspect(data: &[u8]) -> Result<Analysis, String> {
                     .packer_hints
                     .push("UPX: имя секции, эвристика".into());
             }
+            if read32(bytes, 8, false)? > 0
+                && read32(bytes, 16, false)? == 0
+                && read32(bytes, 36, false)? & 0x20000000 != 0
+            {
+                result.notes.push(format!("исполняемая секция {name}: байты отсутствуют в файле; восстановление кода требует распаковки"));
+            }
             result.sections.push(name);
         }
     } else if data.starts_with(b"\x7fELF") {
@@ -267,6 +273,14 @@ pub fn inspect(data: &[u8]) -> Result<Analysis, String> {
         } else {
             apply_cookie(data, position, 24, &mut result);
         }
+    }
+    if result.route == Route::Native
+        && result
+            .compiler_hints
+            .iter()
+            .any(|hint| hint.contains("nuitka:"))
+    {
+        result.notes.push("Nuitka compiles Python into native machine code. This output is C pseudocode, not recovered Python source. Original comments, names and some language structures are lost; lossless Python recovery is not supported. A marker alone does not identify the Commercial edition.".into());
     }
     if result.compiler_hints.is_empty() {
         result
@@ -392,6 +406,38 @@ mod tests {
                 assert_eq!(result.architecture, if x64 { "x64" } else { "x86" });
             }
         }
+    }
+    #[test]
+    fn unbacked_executable_sections_are_reported_without_treating_bss_as_code() {
+        let mut data = pe(false, true);
+        data[134..136].copy_from_slice(&1u16.to_le_bytes());
+        let section = 152 + 240;
+        data[section..section + 5].copy_from_slice(b".text");
+        data[section + 8..section + 12].copy_from_slice(&4096u32.to_le_bytes());
+        data[section + 36..section + 40].copy_from_slice(&0x60000020u32.to_le_bytes());
+        assert!(inspect(&data)
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.contains("байты отсутствуют")));
+        data[section + 36..section + 40].copy_from_slice(&0xc0000080u32.to_le_bytes());
+        assert!(!inspect(&data)
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.contains("байты отсутствуют")));
+    }
+
+    #[test]
+    fn nuitka_is_native_not_python_bytecode() {
+        let mut data = pe(false, true);
+        data.extend_from_slice(b"Nuitka");
+        let result = inspect(&data).unwrap();
+        assert_eq!(result.route, Route::Native);
+        assert!(result
+            .notes
+            .iter()
+            .any(|note| note.contains("lossless Python recovery is not supported")));
     }
 
     #[test]
