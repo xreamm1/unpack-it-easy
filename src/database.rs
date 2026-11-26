@@ -41,15 +41,7 @@ const REPORTS: &[&str] = &[
 ];
 
 fn safe_relative(path: &Path) -> bool {
-    let Some(text) = path.to_str() else {
-        return false;
-    };
-    let normalized = text.replace('\\', "/");
-    !normalized.contains([':', '\0'])
-        && normalized
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
-        && path.components().all(|c| matches!(c, Component::Normal(_)))
+    !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 pub fn export(path: &Path, project: &Project) -> Result<(), String> {
