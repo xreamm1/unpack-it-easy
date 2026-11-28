@@ -207,6 +207,7 @@ mod tests {
         bytes[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
         bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
         bytes[0xb0..0xb8].copy_from_slice(&0x180000000u64.to_le_bytes());
+        bytes[0xd0..0xd4].copy_from_slice(&0x2000u32.to_le_bytes());
         let section = 0x188;
         for (at, value) in [
             (8, 0x600u32),

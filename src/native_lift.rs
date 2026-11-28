@@ -116,18 +116,31 @@ impl<'a> Image<'a> {
                 executable: u32_at(bytes, at + 36)? & 0x20000000 != 0,
             });
         }
+        let base = u64::from_le_bytes(
+            bytes
+                .get(optional + 24..optional + 32)
+                .ok_or("truncated image base")?
+                .try_into()
+                .unwrap(),
+        );
+        let image_size = u32_at(bytes, optional + 56)? as u64;
+        base.checked_add(image_size)
+            .ok_or("PE image address overflow")?;
+        for section in &sections {
+            let end = u64::from(section.rva)
+                .checked_add(section.mapped_size as u64)
+                .ok_or("PE section address overflow")?;
+            if end > image_size {
+                return Err("PE section exceeds image size".into());
+            }
+            base.checked_add(end).ok_or("PE section address overflow")?;
+        }
         Ok(Self {
             bytes,
             sections,
             export: directory(0)?,
             exception: directory(3)?,
-            base: u64::from_le_bytes(
-                bytes
-                    .get(optional + 24..optional + 32)
-                    .ok_or("truncated image base")?
-                    .try_into()
-                    .unwrap(),
-            ),
+            base,
         })
     }
     fn data(&self, rva: u32, length: usize) -> Result<&'a [u8], String> {

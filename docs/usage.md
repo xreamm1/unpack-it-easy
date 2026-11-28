@@ -17,6 +17,8 @@ For Linux builds and native backend setup see [Linux instructions](linux.md). Th
 - Native PE/ELF/Mach-O analysis through Ghidra; .NET recovery through ILSpy.
 - Bounded discovery of related launcher/Nuitka modules, CRT filtering, user-function prioritization, constant initializers, section entropy and data XREF candidates.
 - Electron `.asar` source extraction in Rust, including adjacent `.asar.unpacked` files; Java `.jar` and `.class` decompilation through CFR 0.152.
+- Android `.apk` and standard `.dex` decompilation through managed JADX 1.5.7. Java appears under `source/java`, decoded manifest/resources under `source/resources`, and diagnostics in `jadx.log` and `android-report.json`. Decompiled Java does not reconstruct original Kotlin source; native JNI `.so` files require separate native analysis. Partial output stays available on decompiler errors. Input code is not executed.
+- Android input validation supports standard DEX versions 035 and 037–040. Compact DEX and the 041 container format are explicitly rejected. A failed DEX load is reported as incomplete even when JADX returns resources or exits successfully; Java files bundled as assets are counted as resources.
 - Early MD5/SHA-1/SHA-256 and static indicators: URLs, IPv4/IPv6, file/registry paths, Discord webhooks, Telegram bot endpoints and selected WinAPI names. Evidence includes file, byte offset and encoding. VirusTotal/MalwareBazaar links use the hash; files are not automatically uploaded.
 - Stage timers, object progress, links to incomplete functions, full-log export/copy.
 - Source editor, search, C/Python symbol navigation, virtualized large-file viewing and a clickable minimap.
@@ -26,6 +28,72 @@ For Linux builds and native backend setup see [Linux instructions](linux.md). Th
 
 ## Updates and responsiveness
 
+### Analysis tools and settings
+
+The compact toolbar keeps open/load/save actions visible; other actions are in
+**more**. The language selector remains in the toolbar. **more → tools** includes
+the HEX editor, XREF/types viewer, plugin manager, and report/source comparison.
+
+The HEX editor pages through files up to 512 MiB, supports offset navigation and
+staged byte changes, and saves a verified new copy. It never writes the original.
+Source undo/redo covers edits and renames; history is bounded and session-local.
+Dirty text is saved to separate recovery drafts approximately every five seconds
+when autosave is enabled. Recovery opens a draft in memory. Saving recovered text
+creates a new copy inside the project's source/recovered directory so it is
+included in subsequent .uie exports; without a loaded project a new destination
+must be selected. Original files remain unchanged. This recovers editor drafts,
+not a crashed third-party decompiler's internal state. Source saving runs in a
+worker and rejects an original changed outside the editor.
+
+The XREF viewer uses exported call/data/string references and labels folded
+constants as inference. Missing source locations remain explicit. The types view
+shows struct/union/enum declarations present in recovered C/C++ text; it does not
+infer ABI packing or field offsets. Report export supports static HTML, JSON and
+Markdown. The source comparison view compares two existing decompiler outputs
+positionally; differences do not establish semantic equivalence.
+
+Plugin manifests can be imported disabled, inspected, enabled after executable
+SHA-256 verification, and disabled again. Enabling a manifest does not run it;
+select it explicitly in engine settings and refresh that list after manager
+changes. Appearance settings save a configurable monochrome theme. Defaults keep
+the code background black.
+
+The **settings** button opens **engines and limits**. Choose automatic routing or
+an explicitly enabled [external decompiler plugin](plugins.md), include related
+modules, enable lazy native decompilation, or bypass the result cache. Changes
+are saved between sessions and apply to subsequent analysis jobs.
+
+On Windows, optional Job Object limits cover the analysis process tree: combined
+committed memory (128–65536 MiB) and active processes (1–128). Defaults are 2048 MiB
+and 32 processes. Exceeding these limits can produce a partial result. Processes
+are assigned before execution and descendants are terminated on cleanup. These
+limits are not a filesystem or network sandbox. They are unavailable on other
+platforms and disabled there by default.
+
+The **background** tab has a **disable background** button that restores the
+plain dark background; **enable background** restores the waves. It also selects adaptive refresh and sets
+minimum/maximum frame rates. Minimized windows stop background animation.
+Without desktop OpenGL 3.3, a static egui background is used. The animated field
+is rendered into a bounded half-resolution texture and reused between animation
+frames; the presentation pass remains at window resolution. Adaptive refresh
+accounts for idle input and asynchronously measured field rendering time.
+
+**analysis tools** also provides search across recovered source files (including
+unsaved editor changes), a static call graph with clickable source locations,
+and comparison of two executables or two `.uie` databases. Executable comparison
+reports byte offsets and PE section hashes, not semantic equivalence. Call graphs
+require a native report containing call XREFs; computed or dynamic calls may be
+absent. Search and graph sizes are bounded and truncation is reported.
+
+Owned program round-trip checks are described in [quality tests](quality.md).
+
+Crash Assistant exports, clipboard copies and email attachments redact common
+credentials, home paths, email addresses, webhooks and private keys. Local raw
+preview is opt-in and does not disable export redaction. Full log lines are
+retained; an oversized single line is rejected explicitly. Redaction is pattern
+based, so review reports before sharing. Email export creates a draft with a
+sanitized log attachment; it does not silently send mail.
+
 On startup UIE checks the latest stable GitHub release in a background worker with a timeout. The centered dialog displays the GitHub release notes before offering **update**, **later** and **do not show again**. Notes are shown as plain text, with a link to the full release page. Missing notes have a fallback message; long notes are bounded. The last choice disables automatic checks; the toolbar still allows a manual check. Offline mode skips checks and downloads.
 
 An accepted update is downloaded in the background and checked against the release asset SHA-256. Unsaved edits must be saved before restarting. A helper waits for UIE to exit and atomically replaces the executable, preserving a backup and the engines/projects folders.
@@ -33,6 +101,30 @@ An accepted update is downloaded in the background and checked against the relea
 Result discovery, source reading and symbol indexing run in background workers. Event processing is limited per frame and log writes are batched. Files initially use virtualized viewing; select edit to modify the source. Very long lines show their first 8192 characters in viewing mode; complete source is retained on disk and in project databases.
 
 ## Native Python builds and debugger
+
+### Trace-assisted reconstruction
+
+**Analysis → dynamic trace analysis** imports a recorded execution trace; it does
+not start the input program. PE AMD64 inputs can be bound to a native x64dbg
+`.trace64` recording using its actual runtime module base and an adjacent
+`.uie-trace.json` metadata file. SHA-256 and image-size checks prevent accidental
+association with a different binary. The UI also accepts the explicit JSONL
+format implemented in `src/dynamic_analysis.rs`.
+
+The report separates per-thread observed execution edges, register-based indirect
+targets, and partial pseudocode for the recorded instruction path. Runtime code
+bytes can differ from file bytes; the observations describe that recording only.
+Unsupported instructions remain marked, unvisited branches are not recovered,
+and trace evidence is not proof of full functional equivalence. Recording a
+target is a separate debugger operation in a controlled VM. Native trace parsing
+currently supports uncompressed x64 version-1 recordings, not every debugger
+trace format.
+
+The Rust constant pass also merges agreed known register bits and memory across
+bounded forward branch joins, while conflicting values become unknown. Known
+indirect call/jump targets are emitted as static candidates; concrete bounded
+loop recovery remains available. This does not replace general CFG recovery or
+automatically reconstruct original Python from arbitrary native code.
 
 Nuitka and Cython compile Python to native code. UIE routes these files to Ghidra, not to a Python-bytecode decompiler. Output is C pseudocode and supporting evidence; original Python reconstruction is not guaranteed.
 
@@ -57,7 +149,7 @@ UIE's own log messages and reports are translated for display and log export. Ra
 
 ## Offline mode
 
-While online, select a Python version or **all python versions**, then click **download offline bundle**. This prepares DIE, Python/PyLingual, Ghidra/Java, ILSpy and CFR, plus the selected Python interpreters and model snapshots under `engines`. The all-versions option prepares Python **3.8–3.14** and requires multiple gigabytes. Preparation can be cancelled and rerun; successful version preparations are recorded in `engines/offline-ready.json`.
+While online, select a Python version or **all python versions**, then click **download offline bundle**. This prepares DIE, Python/PyLingual, Ghidra/Java, ILSpy, CFR and JADX, plus the selected Python interpreters and model snapshots under `engines`. Keep `engines/jadx/jadx-1.5.7.zip` as well as the extracted JARs: UIE verifies the installed files against that authenticated archive. The all-versions option prepares Python **3.8–3.14** and requires multiple gigabytes. Preparation can be cancelled and rerun; successful version preparations are recorded in `engines/offline-ready.json`.
 
 After successful preparation, the GUI enables **offline**. This blocks automatic engine downloads and enables offline flags for Hugging Face, Transformers and uv. Missing components produce an error instead of downloading. External hash lookup links are disabled in this mode. Copy the whole `engines` directory alongside the executable when moving the offline installation.
 

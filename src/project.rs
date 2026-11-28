@@ -86,6 +86,14 @@ pub fn cached(
     if source_hashes(&project.output)? != project.source_sha256 {
         return Ok(None);
     }
+    if project.analysis.route == crate::detect::Route::Native {
+        let current = crate::triage::discover(input, &project.analysis)?;
+        if current.truncated
+            || dependency_snapshot(input, &current.modules)? != project.dependency_sha256
+        {
+            return Ok(None);
+        }
+    }
     let triage_file = project.output.join("triage-report.json");
     if triage_file.is_file() {
         let triage: serde_json::Value =

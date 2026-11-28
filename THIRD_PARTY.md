@@ -10,6 +10,7 @@ UIE orchestrates separate backends. Their code and models retain their own licen
 - [RetDec 5.0](https://github.com/avast/retdec/tree/v5.0), MIT with separately licensed bundled dependencies. The Windows offline installer retains `LICENSE`, `LICENSE-PELIB`, `LICENSE-THIRD-PARTY` and runtime support files. Archive SHA-256 is pinned in `src/install-engines.ps1`.
 - [ILSpy](https://github.com/icsharpcode/ILSpy)
 - [CFR 0.152](https://www.benf.org/other/cfr/), MIT; pinned SHA-256 in `src/archives.rs`
+- [JADX 1.5.7](https://github.com/skylot/jadx/tree/v1.5.7), Apache-2.0 with separately licensed dependencies; official distribution SHA-256 is pinned in `src/android.rs`. The authenticated ZIP is retained with the managed installation as its integrity anchor.
 - [uv](https://github.com/astral-sh/uv), [python-build-standalone](https://github.com/astral-sh/python-build-standalone), [CPython](https://github.com/python/cpython)
 - [Eclipse Temurin](https://adoptium.net/)
 

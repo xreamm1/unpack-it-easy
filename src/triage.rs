@@ -65,6 +65,22 @@ fn standard_runtime(name: &str) -> bool {
 }
 
 pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
+    let own_executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    let analyzing_self = input
+        .canonicalize()
+        .ok()
+        .zip(own_executable)
+        .is_some_and(|(input, own)| input == own);
+    discover_with_self(input, analysis, analyzing_self)
+}
+
+fn discover_with_self(
+    input: &Path,
+    analysis: &Analysis,
+    analyzing_self: bool,
+) -> Result<Plan, String> {
     let mut plan = Plan::default();
     if analysis.route != Route::Native {
         return Ok(plan);
@@ -120,6 +136,9 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
                 .is_some_and(|x| x.eq_ignore_ascii_case("pyd"))
         })
     });
+    let cargo_layout = contains(&bytes, "rust_eh_personality")
+        && root.join(".fingerprint").is_dir()
+        && root.join("deps").is_dir();
     let mut queue = vec![(root.to_path_buf(), 0usize)];
     let mut visited = HashSet::new();
     let mut entries = 0;
@@ -155,6 +174,24 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
             }
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             if kind.is_dir() {
+                if depth == 0
+                    && analyzing_self
+                    && ["engines", "results", "projects"].contains(&name.as_str())
+                {
+                    plan.skipped.push(format!(
+                        "{name}: analyzer tools and output are not target application modules"
+                    ));
+                    continue;
+                }
+                if depth == 0
+                    && cargo_layout
+                    && ["deps", "build", "incremental"].contains(&name.as_str())
+                {
+                    plan.skipped.push(format!(
+                        "{name}: Cargo build artifacts excluded from application triage"
+                    ));
+                    continue;
+                }
                 if depth == 0 && name == "runtime" && application_modules {
                     plan.skipped.push("runtime: dependency tree excluded because app contains native user modules".into());
                     continue;
@@ -219,6 +256,7 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
                         Route::PythonArchive | Route::PythonBytecode => "pylingual",
                         Route::Asar => "asar",
                         Route::Java => "cfr",
+                        Route::Android => "jadx",
                         Route::Unknown => "unknown",
                     }
                     .to_string(),
@@ -266,6 +304,57 @@ pub fn discover(input: &Path, analysis: &Analysis) -> Result<Plan, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn self_analysis_does_not_decompile_its_own_engines() {
+        let root = std::env::temp_dir().join(format!("uie-own-engines-{}", std::process::id()));
+        fs::create_dir_all(root.join("engines")).unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();
+        let mut binary = vec![0u8; 64];
+        binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        binary[18..20].copy_from_slice(&62u16.to_le_bytes());
+        fs::write(root.join("engines/helper.dll"), &binary).unwrap();
+        fs::write(root.join("app/actual.pyd"), &binary).unwrap();
+        binary.extend_from_slice(b"engines/ app/ .pyd");
+        let input = root.join("sample.exe");
+        fs::write(&input, &binary).unwrap();
+        let analysis = inspect_file(&input).unwrap();
+        let plan = discover_with_self(&input, &analysis, true).unwrap();
+        assert_eq!(plan.modules.len(), 1);
+        assert!(plan.modules[0].relative.starts_with("app"));
+        let plan = discover_with_self(&input, &analysis, false).unwrap();
+        assert_eq!(plan.modules.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rust_build_artifacts_do_not_replace_actual_application_modules() {
+        let root = std::env::temp_dir().join(format!("uie-cargo-triage-{}", std::process::id()));
+        for folder in ["deps", ".fingerprint", "app"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let mut binary = vec![0u8; 64];
+        binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        binary[18..20].copy_from_slice(&62u16.to_le_bytes());
+        fs::write(root.join("deps/compiler_plugin.dll"), &binary).unwrap();
+        fs::write(root.join("app/real.pyd"), &binary).unwrap();
+        binary.extend_from_slice(b"rust_eh_personality deps/ app/ .pyd");
+        let input = root.join("UIE.exe");
+        fs::write(&input, &binary).unwrap();
+        let analysis = inspect_file(&input).unwrap();
+        let plan = discover(&input, &analysis).unwrap();
+        assert_eq!(plan.modules.len(), 1);
+        assert_eq!(plan.modules[0].relative, Path::new("app/real.pyd"));
+        assert!(plan
+            .skipped
+            .iter()
+            .any(|reason| reason.contains("Cargo build artifacts")));
+        fs::remove_dir_all(root.join(".fingerprint")).unwrap();
+        let plan = discover(&input, &analysis).unwrap();
+        assert!(plan
+            .modules
+            .iter()
+            .any(|module| module.relative.starts_with("deps")));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn hybrid_app_modules_take_priority_over_runtime_tree() {
         let root = std::env::temp_dir().join(format!("uie-hybrid-{}", std::process::id()));

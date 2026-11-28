@@ -104,6 +104,29 @@ def main():
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             result = decompile(pyc=file, save_to=target, version=args.version)
+            if any(not getattr(item, 'success', False) for item in result.equivalence_results):
+                import tempfile
+                from python_recovery import recover_layout
+                from pylingual.utils.generate_bytecode import compile_version, CompileError
+                from pylingual.equivalence_check import PatchedPYC, compare_pyc
+                with tempfile.TemporaryDirectory(prefix='uie-layout-') as folder:
+                    candidate_source = Path(folder) / 'candidate.py'
+                    candidate_bytecode = Path(folder) / 'candidate.pyc'
+                    original = PatchedPYC(result.original_pyc)
+                    def verify_layout(source):
+                        candidate_source.write_text(source, encoding='utf-8')
+                        try:
+                            compile_version(candidate_source, candidate_bytecode, result.version)
+                            return compare_pyc(original, candidate_bytecode)
+                        except CompileError:
+                            return []
+                    candidate, checked, attempts = recover_layout(result.decompiled_source, verify_layout)
+                    if candidate is not None:
+                        target.with_suffix('.py.before-layout-recovery').write_text(result.decompiled_source, encoding='utf-8')
+                        target.write_text(candidate, encoding='utf-8')
+                        result.decompiled_source = candidate
+                        result.equivalence_results = checked
+                    logging.info('UIE layout recovery: %d candidates; accepted=%s', attempts, candidate is not None)
             lines = symbol_lines(result.decompiled_source)
             for item in result.equivalence_results:
                 if not item.success:

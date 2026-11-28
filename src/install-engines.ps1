@@ -9,6 +9,13 @@ $Root = (Resolve-Path -LiteralPath $Root).Path
 $cache = Join-Path $Root 'downloads'
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 
+function File-Sha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
 function Find-Binary([string]$Directory, [string]$Name) {
     if (Test-Path -LiteralPath $Directory) {
         $match = Get-ChildItem -LiteralPath $Directory -Filter $Name -File -Recurse | Select-Object -First 1
@@ -19,7 +26,7 @@ function Find-Binary([string]$Directory, [string]$Name) {
 
 function Fetch([string]$Url, [string]$Path, [string]$Hash='') {
     if (Test-Path -LiteralPath $Path) {
-        if ((Get-Item -LiteralPath $Path).Length -gt 0 -and (!$Hash -or (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $Hash)) { return }
+        if ((Get-Item -LiteralPath $Path).Length -gt 0 -and (!$Hash -or (File-Sha256 $Path) -eq $Hash)) { return }
     }
     Write-Host "Downloading $Url"
     $client = New-Object System.Net.Http.HttpClient
@@ -45,7 +52,7 @@ function Fetch([string]$Url, [string]$Path, [string]$Hash='') {
         }
         $outputStream.Dispose(); $outputStream = $null
         if ($total -eq 0) { throw 'Empty download' }
-        if ($Hash -and (Get-FileHash -LiteralPath ($Path + '.part') -Algorithm SHA256).Hash -ne $Hash) { throw 'SHA256 mismatch' }
+        if ($Hash -and (File-Sha256 ($Path + '.part')) -ne $Hash) { throw 'SHA256 mismatch' }
         Move-Item -LiteralPath ($Path + '.part') -Destination $Path -Force
     } finally {
         if ($outputStream) { $outputStream.Dispose() }
