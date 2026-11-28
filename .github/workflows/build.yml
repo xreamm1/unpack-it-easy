@@ -30,6 +30,8 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
       - if: runner.os != 'Windows'
         run: tar -czf ${{ matrix.artifact }}.tar.gz -C target/release UIE
       - if: runner.os == 'Windows'

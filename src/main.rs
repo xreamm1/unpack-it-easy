@@ -1,6 +1,11 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 mod about;
+mod analysis_views;
+mod android;
 mod archives;
+mod background;
+mod binary_compare;
+mod crash_assistant;
 mod cython;
 mod cython_slots;
 mod database;
@@ -8,21 +13,34 @@ mod debugger;
 mod debugger_export;
 mod detect;
 mod diagnostics;
+mod dynamic_analysis;
+mod editor_history;
+mod editor_recovery;
 mod engine;
+mod hex_editor;
 mod indicators;
+mod inspection_views;
 mod language;
 mod native_index;
 mod native_lift;
+mod plugin_manager;
+mod plugins;
+mod process_limits;
 mod project;
 mod project_diff;
 mod rename;
+mod report_tools;
 mod retdec;
 mod runtime;
+mod source_save;
 mod telemetry;
+mod theme;
 mod triage;
 mod ui;
 mod unpack;
 mod updater;
+mod workspace_chrome;
+mod workspace_tools;
 use engine::{Event, Settings};
 use std::{
     fs,
@@ -98,6 +116,64 @@ fn headless(args: &[std::ffi::OsString]) -> i32 {
 fn main() -> eframe::Result<()> {
     diagnostics::install_hook();
     let args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--analyze-trace") {
+        if args.len() != 5 {
+            std::process::exit(2);
+        }
+        let result = dynamic_analysis::import_trace(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+            &AtomicBool::new(false),
+        );
+        if let Err(error) = &result {
+            eprintln!("{error}");
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if args.get(1).is_some_and(|arg| {
+        arg == "--compare-files" || arg == "--call-graph" || arg == "--search-project"
+    }) {
+        let command = args[1].to_string_lossy();
+        let expected = if command == "--call-graph" { 4 } else { 5 };
+        if args.len() != expected {
+            std::process::exit(2);
+        }
+        let result = (|| -> Result<(), String> {
+            let cancel = AtomicBool::new(false);
+            let value = match command.as_ref() {
+                "--compare-files" => {
+                    binary_compare::compare(Path::new(&args[2]), Path::new(&args[3]))?
+                }
+                "--call-graph" => {
+                    serde_json::to_value(workspace_tools::graph(Path::new(&args[2]), &cancel)?)
+                        .map_err(|e| e.to_string())?
+                }
+                _ => serde_json::to_value(workspace_tools::search(
+                    Path::new(&args[2]),
+                    &args[3].to_string_lossy(),
+                    &[],
+                    &cancel,
+                )?)
+                .map_err(|e| e.to_string())?,
+            };
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&args[expected - 1])
+                .map_err(|e| e.to_string())?;
+            file.write_all(&serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = &result {
+            let _ = fs::write(
+                Path::new(&args[expected - 1]).with_extension("error.log"),
+                error,
+            );
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if args.get(1).is_some_and(|a| a == "--decompile-function") {
         if args.len() != 5 {
             std::process::exit(2);
@@ -253,14 +329,86 @@ fn main() -> eframe::Result<()> {
         "Unpack It Easy (UIE)",
         options,
         Box::new(move |cc| {
+            cc.egui_ctx.set_theme(eframe::egui::Theme::Dark);
             cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
-            cc.egui_ctx.style_mut(|style| style.animation_time = 0.0);
+            let mut fonts = eframe::egui::FontDefinitions::default();
+            for (name, path, family) in [
+                (
+                    "uie-ui",
+                    "C:/Windows/Fonts/segoeui.ttf",
+                    eframe::egui::FontFamily::Proportional,
+                ),
+                (
+                    "uie-code",
+                    "C:/Windows/Fonts/consola.ttf",
+                    eframe::egui::FontFamily::Monospace,
+                ),
+            ] {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts
+                        .font_data
+                        .insert(name.into(), eframe::egui::FontData::from_owned(bytes));
+                    fonts
+                        .families
+                        .entry(family)
+                        .or_default()
+                        .insert(0, name.into());
+                }
+            }
+            cc.egui_ctx.set_fonts(fonts);
+            cc.egui_ctx.style_mut(|style| {
+                use eframe::egui::{Color32, Stroke};
+                style.animation_time = 0.0;
+                style.text_styles.insert(
+                    eframe::egui::TextStyle::Body,
+                    eframe::egui::FontId::proportional(14.0),
+                );
+                style.text_styles.insert(
+                    eframe::egui::TextStyle::Button,
+                    eframe::egui::FontId::proportional(14.0),
+                );
+                style.spacing.button_padding = eframe::egui::vec2(8.0, 4.0);
+                style.spacing.item_spacing = eframe::egui::vec2(8.0, 6.0);
+                style.visuals.override_text_color = Some(Color32::WHITE);
+                style.visuals.selection.bg_fill = Color32::from_gray(70);
+                style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+                style.visuals.hyperlink_color = Color32::WHITE;
+                style.visuals.warn_fg_color = Color32::from_gray(215);
+                style.visuals.error_fg_color = Color32::from_rgb(245, 100, 100);
+                let widgets = &mut style.visuals.widgets;
+                widgets.inactive.bg_fill = Color32::from_gray(46);
+                widgets.inactive.weak_bg_fill = Color32::from_gray(46);
+                widgets.inactive.bg_stroke = Stroke::NONE;
+                widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+                widgets.hovered.bg_fill = Color32::from_gray(66);
+                widgets.hovered.weak_bg_fill = Color32::from_gray(66);
+                widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+                widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+                widgets.active.bg_fill = Color32::from_gray(35);
+                widgets.active.weak_bg_fill = Color32::from_gray(35);
+                widgets.active.bg_stroke = Stroke::NONE;
+                widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+                widgets.open = widgets.inactive;
+            });
             let avatar = cc.egui_ctx.load_texture(
                 "uie-avatar",
                 avatar,
                 eframe::egui::TextureOptions::LINEAR,
             );
             let mut app = ui::Toker::new(input, avatar);
+            if let Some(gl) = &cc.gl {
+                match background::Background::new(gl) {
+                    Ok(background) => {
+                        app.background = Some(std::sync::Arc::new(background));
+                        cc.egui_ctx.style_mut(|style| {
+                            style.visuals.panel_fill = eframe::egui::Color32::TRANSPARENT
+                        });
+                    }
+                    Err(error) => eprintln!("Background renderer unavailable: {error}"),
+                }
+            }
+            cc.egui_ctx
+                .style_mut(|style| style.visuals.panel_fill = eframe::egui::Color32::TRANSPARENT);
             if args.iter().any(|arg| arg == "--about") {
                 app.show_about();
             }

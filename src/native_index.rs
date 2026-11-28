@@ -3,7 +3,7 @@ use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
     path::Path,
@@ -186,6 +186,9 @@ struct Diagnostics {
     runtime_rows_examined: usize,
     invalid_runtime_rows: usize,
     duplicate_runtime_rows: usize,
+    merged_chained_fragments: usize,
+    noncontiguous_chained_functions: usize,
+    invalid_unwind_chains: usize,
     invalid_export_rows: usize,
     forwarded_exports: usize,
     malformed_directories: Vec<&'static str>,
@@ -329,12 +332,154 @@ fn insert<'a>(
         evidence: vec![],
     }))
 }
+type RuntimeRow = (u32, u32, u32);
+const MAX_UNWIND_CHAIN: usize = 64;
+
+fn unwind_owner(
+    pe: &Pe<'_>,
+    mut row: RuntimeRow,
+    rows: &BTreeSet<RuntimeRow>,
+) -> Result<Option<u32>, ()> {
+    let mut seen = Vec::new();
+    let mut frame = None;
+    let mut chained = false;
+    for _ in 0..MAX_UNWIND_CHAIN {
+        if seen.contains(&row) {
+            return Err(());
+        }
+        seen.push(row);
+        let Some(header) = pe.region(row.2, 4, false) else {
+            return if chained { Err(()) } else { Ok(None) };
+        };
+        let version = header[0] & 7;
+        if ![1, 2].contains(&version) {
+            return if chained { Err(()) } else { Ok(None) };
+        }
+        let flags = header[0] >> 3;
+        if let Some(frame) = frame {
+            if header[3] != frame {
+                return Err(());
+            }
+        }
+        frame = Some(header[3]);
+        if flags & 4 == 0 {
+            return Ok(Some(row.0));
+        }
+        if flags != 4 || row.2 & 3 != 0 {
+            return Err(());
+        }
+        chained = true;
+        let offset = 4 + ((u32::from(header[2]) + 1) & !1) * 2;
+        let tail = row
+            .2
+            .checked_add(offset)
+            .and_then(|at| pe.region(at, 12, false))
+            .ok_or(())?;
+        row = (
+            dword(tail, 0).map_err(|_| ())?,
+            dword(tail, 4).map_err(|_| ())?,
+            dword(tail, 8).map_err(|_| ())?,
+        );
+        if !rows.contains(&row) {
+            return Err(());
+        }
+    }
+    Err(())
+}
+
+fn merge_unwind_fragments(
+    pe: &Pe<'_>,
+    rows: &BTreeSet<RuntimeRow>,
+    candidates: &mut BTreeMap<u32, Candidate>,
+    diagnostics: &mut Diagnostics,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut groups: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+    for (index, &row) in rows.iter().enumerate() {
+        if index % 1024 == 0 && cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if !candidates.contains_key(&row.0) {
+            continue;
+        }
+        match unwind_owner(pe, row, rows) {
+            Ok(Some(owner)) => groups.entry(owner).or_default().push((row.0, row.1)),
+            Ok(None) => (),
+            Err(()) => {
+                diagnostics.invalid_unwind_chains += 1;
+                if let Some(item) = candidates.get_mut(&row.0) {
+                    item.end = None;
+                    item.evidence
+                        .push("invalid or unsupported unwind chain; complete extent unknown");
+                }
+            }
+        }
+    }
+    for (owner, mut parts) in groups {
+        if parts.len() < 2 {
+            continue;
+        }
+        parts.sort_unstable();
+        parts.dedup();
+        if parts
+            .iter()
+            .any(|part| candidates.get(&part.0).is_some_and(|item| item.conflict))
+        {
+            for &(begin, _) in &parts {
+                if let Some(item) = candidates.get_mut(&begin) {
+                    item.end = None;
+                    item.evidence
+                        .push("conflicting chained fragment; complete owner extent unknown");
+                }
+            }
+            continue;
+        }
+        let contiguous = parts.first().is_some_and(|part| part.0 == owner)
+            && parts.windows(2).all(|pair| pair[0].1 == pair[1].0);
+        if !contiguous {
+            diagnostics.noncontiguous_chained_functions += 1;
+            for &(begin, _) in &parts {
+                if let Some(item) = candidates.get_mut(&begin) {
+                    item.end = None;
+                    item.evidence.push(
+                        "noncontiguous chained function; range selection requires all fragments",
+                    );
+                }
+            }
+            continue;
+        }
+        let end = parts.last().unwrap().1;
+        if pe.region(owner, (end - owner) as usize, true).is_none() {
+            for &(begin, _) in &parts {
+                if let Some(item) = candidates.get_mut(&begin) {
+                    item.end = None;
+                    item.evidence.push(
+                        "chained aggregate crosses mapped regions; complete extent unavailable",
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(item) = candidates.get_mut(&owner) {
+            item.end = Some(end);
+            item.evidence
+                .push("contiguous fragments joined by validated chained UNWIND_INFO");
+        }
+        for &(begin, _) in parts.iter().skip(1) {
+            candidates.remove(&begin);
+            diagnostics.merged_chained_fragments += 1;
+        }
+    }
+    Ok(())
+}
+
 fn index(
     pe: &Pe<'_>,
     cancel: &AtomicBool,
 ) -> Result<(BTreeMap<u32, Candidate>, Diagnostics), String> {
     let mut candidates = BTreeMap::new();
     let mut diagnostics = Diagnostics { unbacked_virtual_sections: pe.sections.iter().filter(|section|section.size==0&&section.virtual_size>0).map(|section|UnbackedSection{ name:section.name.clone(),rva:format!("0x{:x}",section.rva),virtual_size:section.virtual_size,executable:section.executable,interpretation:"Virtual range has no raw file bytes; not decoded or filled with invented zero instructions. Executable content may require unpacking; zero-backed data sections alone do not prove packing." }).collect(), ..Diagnostics::default() };
+    let mut runtime_rows = BTreeSet::new();
     let (runtime_rva, runtime_size) = pe.runtime;
     if runtime_rva != 0 && runtime_size != 0 {
         let count = runtime_size as usize / 12;
@@ -362,6 +507,7 @@ fn index(
                 diagnostics.invalid_runtime_rows += 1;
                 continue;
             }
+            runtime_rows.insert((begin, end, dword(record, 8)?));
             if let Some(item) = insert(&mut candidates, begin, &mut diagnostics) {
                 if item
                     .evidence
@@ -380,6 +526,7 @@ fn index(
             }
         }
     }
+    merge_unwind_fragments(pe, &runtime_rows, &mut candidates, &mut diagnostics, cancel)?;
     let (export_rva, export_size) = pe.exports;
     if export_rva != 0 && export_size != 0 {
         if let Some(header) = pe.region(export_rva, 40, false) {
@@ -528,6 +675,29 @@ pub fn build(input: &Path, output: &Path, cancel: &AtomicBool) -> Result<usize, 
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires the local static I18n PE fixture via UIE_CHAIN_SAMPLE"]
+    fn real_cython_initializer_joins_all_nine_unwind_regions() {
+        let input = std::env::var_os("UIE_CHAIN_SAMPLE").expect("UIE_CHAIN_SAMPLE");
+        let bytes = fs::read(input).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "3b9178da9ffd2940ffcba367fa68ed408b43d6cdfb15177a41fbd34b92fbb182"
+        );
+        let (functions, diagnostics) =
+            index(&Pe::parse(&bytes).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(functions[&0x2eb0].end, Some(0x4e63));
+        for begin in [
+            0x2f2a, 0x2f32, 0x2f47, 0x2f4f, 0x2f57, 0x2f5f, 0x2f67, 0x2f6f,
+        ] {
+            assert!(
+                !functions.contains_key(&begin),
+                "fragment {begin:x} indexed separately"
+            );
+        }
+        assert!(diagnostics.merged_chained_fragments >= 8);
+    }
+
     fn fixture() -> Vec<u8> {
         let mut bytes = vec![0u8; 0x800];
         bytes[..2].copy_from_slice(b"MZ");
@@ -561,6 +731,95 @@ mod tests {
             bytes[at + 4..at + 8].copy_from_slice(&end.to_le_bytes());
         }
         bytes
+    }
+    fn chain_fixture(gap: bool, cycle: bool) -> Vec<u8> {
+        let mut bytes = fixture();
+        bytes[0x124..0x128].copy_from_slice(&24u32.to_le_bytes());
+        for (index, (begin, end, unwind)) in [
+            (0x1010u32, 0x1020u32, 0x1400u32),
+            (
+                if gap { 0x1040 } else { 0x1020 },
+                if gap { 0x1050 } else { 0x1030 },
+                0x1410,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (offset, value) in [(0, begin), (4, end), (8, unwind)] {
+                bytes[0x500 + index * 12 + offset..0x504 + index * 12 + offset]
+                    .copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes[0x600] = 1;
+        bytes[0x610] = 0x21;
+        let chained = if cycle {
+            (0x1020u32, 0x1030u32, 0x1410u32)
+        } else {
+            (0x1010, 0x1020, 0x1400)
+        };
+        for (offset, value) in [(0, chained.0), (4, chained.1), (8, chained.2)] {
+            bytes[0x614 + offset..0x618 + offset].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+    #[test]
+    fn contiguous_chained_unwind_regions_form_one_complete_function() {
+        let bytes = chain_fixture(false, false);
+        let (functions, diagnostics) =
+            index(&Pe::parse(&bytes).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[&0x1010].end, Some(0x1030));
+        assert_eq!(diagnostics.merged_chained_fragments, 1);
+    }
+    #[test]
+    fn conflicting_child_invalidates_its_complete_owner_extent() {
+        let mut bytes = chain_fixture(false, false);
+        bytes[0x124..0x128].copy_from_slice(&36u32.to_le_bytes());
+        for (offset, value) in [(0, 0x1020u32), (4, 0x1040), (8, 0x1410)] {
+            bytes[0x518 + offset..0x51c + offset].copy_from_slice(&value.to_le_bytes());
+        }
+        let (functions, diagnostics) =
+            index(&Pe::parse(&bytes).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert!(functions[&0x1020].conflict);
+        assert_eq!(functions[&0x1010].end, None);
+        assert_eq!(diagnostics.merged_chained_fragments, 0);
+    }
+    #[test]
+    fn chained_aggregate_across_sections_is_not_a_complete_fragment() {
+        let mut bytes = chain_fixture(false, false);
+        bytes[0x86..0x88].copy_from_slice(&2u16.to_le_bytes());
+        for offset in [8, 16] {
+            bytes[0x188 + offset..0x18c + offset].copy_from_slice(&0x20u32.to_le_bytes());
+        }
+        for (offset, value) in [
+            (8, 0x5e0u32),
+            (12, 0x1020),
+            (16, 0x5e0),
+            (20, 0x220),
+            (36, 0x60000020),
+        ] {
+            bytes[0x1b0 + offset..0x1b4 + offset].copy_from_slice(&value.to_le_bytes());
+        }
+        let (functions, diagnostics) =
+            index(&Pe::parse(&bytes).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(functions[&0x1010].end, None);
+        assert_eq!(functions[&0x1020].end, None);
+        assert_eq!(diagnostics.merged_chained_fragments, 0);
+    }
+    #[test]
+    fn cyclic_and_noncontiguous_unwind_chains_do_not_invent_complete_ranges() {
+        let bytes = chain_fixture(false, true);
+        let (functions, diagnostics) =
+            index(&Pe::parse(&bytes).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(functions[&0x1020].end, None);
+        assert_eq!(diagnostics.invalid_unwind_chains, 1);
+        let bytes = chain_fixture(true, false);
+        let (functions, diagnostics) =
+            index(&Pe::parse(&bytes).unwrap(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(functions[&0x1010].end, None);
+        assert_eq!(functions[&0x1040].end, None);
+        assert_eq!(diagnostics.noncontiguous_chained_functions, 1);
     }
     #[test]
     fn metadata_index_keeps_good_ranges_when_another_runtime_row_is_bad() {

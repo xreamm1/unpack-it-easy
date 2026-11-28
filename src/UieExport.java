@@ -20,6 +20,9 @@ public class UieExport extends HeadlessScript {
     private static final int WINDOWS_PER_SECTION = 8;
     private static final double ENTROPY_THRESHOLD = 7.2;
     private static final int MAX_XREFS = 2048;
+    private static final int MAX_CALL_XREFS = 65536;
+    private static final int MAX_CALL_XREF_INSTRUCTIONS = 4000000;
+    private static final int MAX_CALL_XREF_REFERENCES = 1000000;
     private static final String[] USER_NAMES = {"impl_", "modulecode_", "Nuitka_Function", "_create_compiled_function", "__pyx_pf", "__pyx_f"};
     private static final String[] INIT_NAMES = {"_initConstants", "createModuleConstants", "module_init", "PyInit_", "modulecode_"};
     private static final String[] CRT_PREFIXES = {"__scrt", "__acrt", "__vcrt", "__security_", "_RTC_", "_guard_", "__guard_", "_GSHandler", "__CxxFrameHandler", "_except_handler", "__std_", "std::", "__gnu_cxx::", "__stdio_", "__crt_", "__SEH_", "_Unwind_", "__mingw_", "__chkstk", "___chkstk", "__alloca_", "__except_", "__imp_"};
@@ -93,6 +96,50 @@ public class UieExport extends HeadlessScript {
         if (user(function)) return 0;
         if (initializer(function)) return 1;
         return candidates.contains(function.getEntryPoint()) ? 2 : 3;
+    }
+    private Map<String,Object> callXrefs(List<Function> selected) throws IOException {
+        List<Map<String,Object>> calls=new ArrayList<>();
+        Map<Address,Function> indexed=new HashMap<>();
+        for(Function function:selected){
+            if(monitor.isCancelled())throw new IOException("Cancelled");
+            indexed.put(function.getEntryPoint(),function);
+        }
+        ReferenceManager references=currentProgram.getReferenceManager();
+        int instructionsScanned=0,referencesScanned=0;
+        boolean truncated=false;
+        scan: for(Function function:selected){
+            InstructionIterator instructions=currentProgram.getListing().getInstructions(function.getBody(),true);
+            while(instructions.hasNext()){
+                if(monitor.isCancelled())throw new IOException("Cancelled");
+                if(instructionsScanned>=MAX_CALL_XREF_INSTRUCTIONS){truncated=true;break scan;}
+                Instruction instruction=instructions.next();instructionsScanned++;
+                Address site=instruction.getAddress();
+                Function caller=getFunctionContaining(site);
+                if(caller==null||!caller.getEntryPoint().equals(function.getEntryPoint()))continue;
+                // Computed instructions remain unresolved even if analysis has
+                // attached a speculative target reference to their call site.
+                if(!instruction.getFlowType().isCall()||instruction.getFlowType().isComputed())continue;
+                ReferenceIterator outgoing=references.getReferenceIterator(site);
+                while(outgoing.hasNext()){
+                    if(monitor.isCancelled())throw new IOException("Cancelled");
+                    if(referencesScanned>=MAX_CALL_XREF_REFERENCES){truncated=true;break scan;}
+                    Reference reference=outgoing.next();
+                    if(!site.equals(reference.getFromAddress()))break;
+                    referencesScanned++;
+                    RefType type=reference.getReferenceType();
+                    if(!type.isCall()||type.isComputed())continue;
+                    Function target=indexed.get(reference.getToAddress());
+                    if(target==null)continue;
+                    if(calls.size()>=MAX_CALL_XREFS){truncated=true;break scan;}
+                    calls.add(row("from_address",caller.getEntryPoint().toString(),"from_function",caller.getSymbol().getName(true),
+                        "target_address",target.getEntryPoint().toString(),"target_function",target.getSymbol().getName(true),
+                        "instruction_address",site.toString(),"kind","ghidra_static_call_reference"));
+                }
+            }
+        }
+        return row("call_xrefs",calls,"xref_analysis",row("truncated",truncated,"indirect_calls_resolved",false,
+            "instructions_scanned",instructionsScanned,"references_scanned",referencesScanned,
+            "interpretation","Bounded static Ghidra call references between selected function entries. Computed calls are excluded. This is not a complete or dynamic call graph."));
     }
     private List<Map<String,Object>> applyPythonMethodHints() {
         List<Map<String,Object>> applied=new ArrayList<>();
@@ -235,6 +282,7 @@ public class UieExport extends HeadlessScript {
                 }
             }
             Map<String,Object> report=row("source_file",output.getFileName().toString(),"decompiled",0,"failed",0,"lazy",true,"indexed",functions.size(),"functions",functions,"filtered_runtime",skipped.size(),"skipped_functions",skipped,"sections",sections,"high_entropy_sections",highEntropy,"constant_data_xrefs",references,"python_method_abi_hints",pythonMethodHints);
+            report.putAll(callXrefs(queue));
             Files.writeString(output.resolveSibling("native-report.json"),new GsonBuilder().setPrettyPrinting().create().toJson(report),StandardCharsets.UTF_8);
             event(row("kind","progress","phase","native function index ready","file",source,"done",queue.size(),"total",queue.size()));
             return;
@@ -318,6 +366,7 @@ public class UieExport extends HeadlessScript {
         }
         Map<String,Object> report=row("source_file",output.getFileName().toString(),"decompiled",success,"failed",failed,"filtered_runtime",skipped.size(),"skipped_functions",skipped,"functions",functions,"constant_initializers",initializers,"sections",sections,"high_entropy_sections",highEntropy,"constant_data_xrefs",references,"python_string_references",pythonStrings,"xrefs_truncated",limited,"entropy_threshold",ENTROPY_THRESHOLD,"interpretation","Entropy and XREFs identify candidate constant/data-processing sites. Nuitka Commercial and encryption are not proven by entropy alone.");
         report.put("python_method_abi_hints",pythonMethodHints);
+        report.putAll(callXrefs(queue.subList(0,processed)));
         report.put("analysis_timed_out",analysisTimedOut);
         report.put("pending_functions",queue.size()-processed);
         report.put("function_timeout_seconds",TIMEOUT);

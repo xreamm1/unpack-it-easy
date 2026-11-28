@@ -37,11 +37,19 @@ struct Document {
     symbols: Vec<(usize, String, bool)>,
     max_columns: usize,
     line_cache: HashMap<usize, egui::text::LayoutJob>,
+    history: crate::editor_history::History,
+    history_epoch: u64,
+    revision: u64,
+    baseline_sha256: String,
+    recovery_conflict: bool,
 }
 
 impl Document {
     fn new(path: PathBuf, text: String) -> Self {
         let mut doc = Self {
+            baseline_sha256: crate::editor_recovery::baseline(&text),
+            revision: 0,
+            recovery_conflict: false,
             path,
             text,
             dirty: false,
@@ -49,11 +57,14 @@ impl Document {
             symbols: vec![],
             max_columns: 0,
             line_cache: HashMap::new(),
+            history: crate::editor_history::History::default(),
+            history_epoch: 0,
         };
         doc.reindex();
         doc
     }
     fn reindex(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.line_starts = std::iter::once(0)
             .chain(
                 self.text
@@ -115,6 +126,27 @@ impl Document {
         }
         self.line_cache.clear();
     }
+
+    fn replace_text(&mut self, text: String) {
+        self.history.record(&self.text, &text);
+        self.text = text;
+        self.dirty = true;
+        self.reindex();
+        self.history_epoch = self.history_epoch.wrapping_add(1);
+    }
+
+    fn navigate_history(&mut self, redo: bool) -> bool {
+        let changed = if redo {
+            self.history.redo(&mut self.text)
+        } else {
+            self.history.undo(&mut self.text)
+        };
+        if changed {
+            self.dirty = true;
+            self.reindex();
+        }
+        changed
+    }
 }
 
 struct NativeReport {
@@ -140,6 +172,7 @@ struct LoadedWorkspace {
     session: Session,
     native_reports: Vec<NativeReport>,
     triage_report: Option<String>,
+    android_report: Option<String>,
 }
 impl LoadedWorkspace {
     fn read(output: PathBuf, session: Session) -> Self {
@@ -153,8 +186,15 @@ impl LoadedWorkspace {
             session,
             native_reports: vec![],
             triage_report: None,
+            android_report: None,
         };
         loaded.load_sources();
+        loaded.android_report = loaded.output.as_ref().and_then(|root| {
+            let file = fs::File::open(root.join("android-report.json")).ok()?;
+            let mut text = String::new();
+            file.take(128 * 1024).read_to_string(&mut text).ok()?;
+            Some(text)
+        });
         if let (Some(root), Some(relative)) = (&loaded.output, &loaded.session.active_file) {
             if relative
                 .components()
@@ -192,7 +232,7 @@ impl LoadedWorkspace {
                                 && entry.path().extension().is_some_and(|e| {
                                     [
                                         "py", "cs", "c", "h", "java", "js", "ts", "jsx", "tsx",
-                                        "json", "html", "css", "mjs", "cjs",
+                                        "json", "html", "css", "mjs", "cjs", "xml", "smali", "txt",
                                     ]
                                     .iter()
                                     .any(|x| e == *x)
@@ -363,6 +403,19 @@ impl LoadedWorkspace {
 }
 
 pub struct Toker {
+    recovery: crate::editor_recovery::Controller,
+    recovery_candidates: Vec<crate::editor_recovery::Candidate>,
+    recovery_open: bool,
+    hex: crate::hex_editor::HexEditor,
+    inspection: crate::inspection_views::Inspection,
+    report_tools: crate::report_tools::Tools,
+    dynamic_analysis: crate::dynamic_analysis::DynamicAnalysis,
+    plugin_manager: crate::plugin_manager::Manager,
+    chrome: crate::workspace_chrome::Chrome,
+    offline_options: bool,
+    analysis_tools: crate::analysis_views::Tools,
+    pub background: Option<Arc<crate::background::Background>>,
+    crash_assistant: crate::crash_assistant::Assistant,
     about: crate::about::About,
     debugger_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     debugger_ready: Option<PathBuf>,
@@ -396,9 +449,10 @@ pub struct Toker {
     verification: String,
     log_file: Option<PathBuf>,
     cursor_line: Option<usize>,
-    avatar: egui::TextureHandle,
+    _avatar: egui::TextureHandle,
     native_reports: Vec<NativeReport>,
     triage_report: Option<String>,
+    android_report: Option<String>,
     indicators: Option<crate::indicators::Report>,
     ioc_filter: String,
     rename_open: bool,
@@ -417,6 +471,10 @@ pub struct Toker {
     document_rx: Option<mpsc::Receiver<Result<Document, String>>>,
     lazy_rx: Option<mpsc::Receiver<(PathBuf, Result<PathBuf, String>)>>,
     utility_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    base_save_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    source_save_rx: Option<mpsc::Receiver<crate::source_save::Batch>>,
+    pending_base_path: Option<PathBuf>,
+    update_after_save: bool,
     literal_query: String,
     literal_hits: Vec<(String, Option<Problem>)>,
 }
@@ -471,7 +529,12 @@ impl Toker {
         if self.busy {
             return;
         }
-        if self.has_unsaved() && !self.save_base() {
+        if self.has_unsaved() {
+            self.update_after_save = true;
+            self.save_base();
+            if self.base_save_rx.is_none() {
+                self.update_after_save = false;
+            }
             return;
         }
         let Some(path) = &self.downloaded_update else {
@@ -571,7 +634,13 @@ impl Toker {
                     {
                         if self.downloaded_update.is_some() {
                             self.apply_update(ctx);
-                        } else if !self.has_unsaved() || self.save_base() {
+                        } else if self.has_unsaved() {
+                            self.update_after_save = true;
+                            self.save_base();
+                            if self.base_save_rx.is_none() {
+                                self.update_after_save = false;
+                            }
+                        } else {
                             self.update_rx = Some(crate::updater::start_download(release));
                         }
                     }
@@ -593,11 +662,40 @@ impl Toker {
         let settings = Settings::load();
         crate::language::set(settings.english);
         let mut app = Self {
+            recovery: {
+                #[cfg(not(test))]
+                {
+                    crate::editor_recovery::Controller::default()
+                }
+                #[cfg(test)]
+                {
+                    crate::editor_recovery::Controller::new(std::env::temp_dir().join(format!(
+                            "uie-ui-drafts-{}-{}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos()
+                        )))
+                }
+            },
+            recovery_candidates: Vec::new(),
+            recovery_open: false,
+            hex: crate::hex_editor::HexEditor::default(),
+            inspection: crate::inspection_views::Inspection::default(),
+            report_tools: crate::report_tools::Tools::default(),
+            dynamic_analysis: crate::dynamic_analysis::DynamicAnalysis::default(),
+            plugin_manager: crate::plugin_manager::Manager::default(),
+            chrome: crate::workspace_chrome::Chrome::default(),
+            offline_options: false,
+            crash_assistant: crate::crash_assistant::Assistant::default(),
+            analysis_tools: crate::analysis_views::Tools::default(),
             about: crate::about::About::default(),
             debugger_rx: None,
             debugger_ready: None,
             debugger_prompt: false,
             settings,
+            background: None,
             input: None,
             analysis: None,
             output: None,
@@ -626,9 +724,10 @@ impl Toker {
             verification: String::new(),
             log_file: None,
             cursor_line: None,
-            avatar,
+            _avatar: avatar,
             native_reports: vec![],
             triage_report: None,
+            android_report: None,
             indicators: None,
             ioc_filter: String::new(),
             rename_open: false,
@@ -647,6 +746,10 @@ impl Toker {
             document_rx: None,
             lazy_rx: None,
             utility_rx: None,
+            base_save_rx: None,
+            source_save_rx: None,
+            pending_base_path: None,
+            update_after_save: false,
             literal_query: String::new(),
             literal_hits: vec![],
         };
@@ -724,6 +827,7 @@ impl Toker {
         self.active = workspace.active;
         self.native_reports = workspace.native_reports;
         self.triage_report = workspace.triage_report;
+        self.android_report = workspace.android_report;
         self.complete = true;
         self.stage = 6;
         self.status = project.verification.clone();
@@ -1040,7 +1144,7 @@ impl Toker {
                                 row["value"].as_str().unwrap_or("?")
                             );
                             let text = if row["kind"].as_str() == Some("string_candidate") {
-                                RichText::new(text).color(Color32::from_rgb(235, 192, 98))
+                                RichText::new(text).color(Color32::from_gray(194))
                             } else {
                                 RichText::new(text)
                             };
@@ -1405,6 +1509,13 @@ impl Toker {
                 }
             });
         }
+        if let Some(report) = &self.android_report {
+            ui.collapsing("Android / JADX", |ui| {
+                egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
+                    ui.monospace(report);
+                });
+            });
+        }
         if let Some(triage) = &self.triage_report {
             ui.collapsing("directory triage", |ui| {
                 egui::ScrollArea::both().max_height(240.0).show(ui, |ui| {
@@ -1423,7 +1534,7 @@ impl Toker {
         }
         ui.separator();
         ui.colored_label(
-            Color32::from_rgb(242, 158, 122),
+            Color32::from_gray(173),
             tr(&format!(
                 "несовпадающие объекты: {}",
                 self.session.problems.len()
@@ -1484,38 +1595,37 @@ impl Toker {
         };
         path.set_extension("uie");
         if !self.save(true) {
+            if self.source_save_rx.is_some() {
+                self.pending_base_path = Some(path);
+            }
             return false;
         }
         self.persist_session();
         let output = self.output.clone().unwrap();
-        let result = crate::project::capture(
-            &self.input_hash,
-            &output,
-            self.settings.all_modules,
-            self.analysis.as_ref().unwrap(),
-        )
-        .and_then(|mut project| {
-            project.verification = if self.base_dirty {
-                tr("ручные правки сохранены; эквивалентность после редактирования не проверена")
-            } else if self.verification.is_empty() {
-                self.status.clone()
-            } else {
-                self.verification.clone()
-            };
-            crate::database::export(&path, &project)
+        let hash = self.input_hash.clone();
+        let all_modules = self.settings.all_modules;
+        let analysis = self.analysis.clone().unwrap();
+        let verification = if self.base_dirty {
+            tr("ручные правки сохранены; эквивалентность после редактирования не проверена")
+        } else if self.verification.is_empty() {
+            self.status.clone()
+        } else {
+            self.verification.clone()
+        };
+        let (tx, rx) = mpsc::channel();
+        self.base_save_rx = Some(rx);
+        self.busy = true;
+        self.status = "saving project database…".into();
+        thread::spawn(move || {
+            let result = crate::project::capture(&hash, &output, all_modules, &analysis)
+                .and_then(|mut project| {
+                    project.verification = verification;
+                    crate::database::export(&path, &project)
+                })
+                .map(|()| path);
+            let _ = tx.send(result);
         });
-        match result {
-            Ok(()) => {
-                self.base_path = Some(path.clone());
-                self.base_dirty = false;
-                self.status = tr(&format!("база сохранена: {}", path.display()));
-                true
-            }
-            Err(error) => {
-                self.status = tr(&format!("ошибка сохранения базы: {error}"));
-                false
-            }
-        }
+        false
     }
     fn start(&mut self, input: PathBuf) {
         if self.busy {
@@ -1553,6 +1663,7 @@ impl Toker {
         self.native_reports.clear();
         self.triage_report = None;
         self.complete = false;
+        self.android_report = None;
         self.busy = true;
         self.stage = 0;
         self.status = tr("чтение файла…");
@@ -1571,17 +1682,57 @@ impl Toker {
     }
 
     fn save(&mut self, all: bool) -> bool {
-        for (index, doc) in self.documents.iter_mut().enumerate() {
-            if doc.dirty && (all || self.active == Some(index)) {
-                if let Err(error) = fs::write(&doc.path, &doc.text) {
-                    self.status = error.to_string();
-                    return false;
-                }
-                doc.dirty = false;
-            }
+        if self.base_save_rx.is_some() || self.source_save_rx.is_some() {
+            return false;
         }
-        self.status = tr("изменения сохранены");
-        true
+        let mut requests = Vec::new();
+        let mut total = 0usize;
+        for (index, doc) in self
+            .documents
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| d.dirty && (all || self.active == Some(*i)))
+        {
+            total = total.saturating_add(doc.text.len());
+            if total > 128 * 1024 * 1024 {
+                self.status = "save batch exceeds 128 MiB; save files separately".into();
+                return false;
+            }
+            let destination = if doc.recovery_conflict && self.output.is_none() {
+                let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(doc.path.file_name().unwrap_or_default().to_string_lossy())
+                    .save_file()
+                else {
+                    return false;
+                };
+                Some(path)
+            } else {
+                None
+            };
+            requests.push(crate::source_save::Request {
+                index,
+                path: doc.path.clone(),
+                text: doc.text.clone(),
+                baseline: doc.baseline_sha256.clone(),
+                recovered: doc.recovery_conflict,
+                workspace: self.output.clone(),
+                destination,
+            });
+        }
+        if requests.is_empty() {
+            return true;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.source_save_rx = Some(rx);
+        self.busy = true;
+        self.status = tr("сохранение исходников");
+        thread::spawn(move || {
+            let _ = tx.send(crate::source_save::write(requests));
+        });
+        false
+    }
+    fn saves_in_progress(&self) -> bool {
+        self.base_save_rx.is_some() || self.source_save_rx.is_some()
     }
     fn load_sources(&mut self) {
         let Some(output) = self.output.clone() else {
@@ -1615,6 +1766,73 @@ impl Toker {
         });
     }
     fn poll(&mut self) {
+        let sources = self
+            .source_save_rx
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(batch) => Some(batch),
+                Err(mpsc::TryRecvError::Disconnected) => Some(crate::source_save::Batch {
+                    saved: Vec::new(),
+                    error: Some("source save worker stopped".into()),
+                }),
+                Err(_) => None,
+            });
+        if let Some(batch) = sources {
+            self.source_save_rx = None;
+            self.busy = false;
+            for saved in batch.saved {
+                if let Some(doc) = self.documents.get_mut(saved.index) {
+                    if doc.path == saved.original {
+                        doc.path = saved.path.clone();
+                        doc.baseline_sha256 = saved.baseline;
+                        doc.dirty = false;
+                        doc.recovery_conflict = false;
+                        if !self.files.contains(&saved.path) {
+                            self.files.push(saved.path);
+                        }
+                        if let Err(error) = self.recovery.mark_saved(&saved.original) {
+                            self.status = error;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = batch.error {
+                self.status = error;
+                self.pending_base_path = None;
+            } else {
+                self.status = tr("изменения сохранены");
+                if let Some(path) = self.pending_base_path.take() {
+                    self.base_path = Some(path);
+                    self.save_base();
+                }
+            }
+        }
+
+        let saved = self
+            .base_save_rx
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("project save worker stopped".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(result) = saved {
+            self.base_save_rx = None;
+            self.busy = false;
+            match result {
+                Ok(path) => {
+                    self.base_path = Some(path.clone());
+                    self.base_dirty = false;
+                    self.status = tr(&format!("база сохранена: {}", path.display()));
+                }
+                Err(error) => {
+                    self.update_after_save = false;
+                    self.status = tr(&format!("ошибка сохранения базы: {error}"));
+                }
+            }
+        }
         let utility = self.utility_rx.as_ref().and_then(|rx| match rx.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Disconnected) => Some(Err("operation worker stopped".into())),
@@ -1682,6 +1900,7 @@ impl Toker {
             self.active = loaded.active;
             self.native_reports = loaded.native_reports;
             self.triage_report = loaded.triage_report;
+            self.android_report = loaded.android_report;
             self.session.problems = loaded.session.problems;
             self.tab = if self.active.is_some() {
                 if self.base_path.is_some() {
@@ -1755,11 +1974,10 @@ impl Toker {
                 Event::Identity(hash) => self.input_hash = hash,
                 Event::Progress(progress) => {
                     log_batch.push_str(&format!(
-                        "{} · {} · {} / {} objects\n",
+                        "{} · {} · {}\n",
                         progress.file,
                         tr(&progress.phase),
-                        progress.done,
-                        progress.total
+                        progress.counter(self.settings.english)
                     ));
                     self.session.progress = Some(progress);
                 }
@@ -1792,6 +2010,7 @@ impl Toker {
             self.busy = false;
             self.status = tr("рабочий поток остановлен");
             self.receiver = None;
+            self.crash_assistant.reload(None, false);
         }
     }
     fn progress(&mut self, ui: &mut egui::Ui) {
@@ -1799,13 +2018,7 @@ impl Toker {
         ui.add_space(10.0);
         for (index, label) in STAGES.iter().enumerate() {
             let active = self.busy && index == self.stage;
-            let color = if active {
-                Color32::from_rgb(114, 222, 193)
-            } else if index < self.stage || self.complete {
-                Color32::from_gray(200)
-            } else {
-                Color32::from_gray(85)
-            };
+            let color = Color32::WHITE;
             ui.horizontal(|ui| {
                 if active {
                     ui.spinner();
@@ -1820,7 +2033,7 @@ impl Toker {
                             .color(color),
                     );
                 } else if index < self.stage {
-                    ui.weak("—");
+                    ui.weak("\u{2014}");
                 }
             });
             ui.add_space(10.0);
@@ -1841,12 +2054,22 @@ impl Toker {
         if let Some(progress) = &self.session.progress {
             ui.label(format!("{} · {}", progress.file, tr(&progress.phase)));
             if progress.total > 0 {
-                ui.add(
-                    egui::ProgressBar::new(
-                        progress.done.min(progress.total) as f32 / progress.total as f32,
-                    )
-                    .text(format!("{} / {} objects", progress.done, progress.total)),
+                ui.label(
+                    RichText::new(progress.counter(self.settings.english))
+                        .color(Color32::WHITE)
+                        .size(12.0),
                 );
+                ui.scope(|ui| {
+                    ui.visuals_mut().extreme_bg_color = Color32::from_gray(34);
+                    ui.add(
+                        egui::ProgressBar::new(
+                            progress.done.min(progress.total) as f32 / progress.total as f32,
+                        )
+                        .fill(Color32::from_gray(150))
+                        .desired_height(5.0)
+                        .rounding(1.0),
+                    );
+                });
             }
         }
         self.problem_links(ui);
@@ -1859,7 +2082,7 @@ impl Toker {
         if !self.busy && !self.session.problems.is_empty() {
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    Color32::from_rgb(242, 158, 122),
+                    Color32::from_gray(173),
                     tr(&format!(
                         "требуют проверки: {} несовпадающих объектов",
                         self.session.problems.len()
@@ -1874,65 +2097,123 @@ impl Toker {
             ui.centered_and_justified(|ui| ui.label(tr("код появится здесь после декомпиляции")));
             return;
         };
-        egui::ScrollArea::horizontal()
-            .id_salt("tabs")
+        let mut close = None;
+        egui::Frame::none()
+            .fill(Color32::from_gray(24))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (index, doc) in self.documents.iter().enumerate() {
-                        let title = format!(
-                            "{}{}",
-                            doc.path.file_name().unwrap_or_default().to_string_lossy(),
-                            if doc.dirty { " *" } else { "" }
-                        );
-                        if ui.selectable_label(active == index, title).clicked() {
-                            self.active = Some(index);
-                        }
-                    }
-                });
+                ui.set_min_height(35.0);
+                ui.spacing_mut().item_spacing.x = 0.0;
+                egui::ScrollArea::horizontal()
+                    .id_salt("document-tabs")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (index, doc) in self.documents.iter().enumerate() {
+                                let active_tab = active == index;
+                                egui::Frame::none()
+                                    .fill(if active_tab {
+                                        Color32::BLACK
+                                    } else {
+                                        Color32::from_gray(24)
+                                    })
+                                    .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            let name = doc
+                                                .path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy();
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(name).size(14.0).color(
+                                                            Color32::from_gray(if active_tab {
+                                                                230
+                                                            } else {
+                                                                150
+                                                            }),
+                                                        ),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(doc.path.display().to_string())
+                                                .clicked()
+                                            {
+                                                self.active = Some(index);
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(if doc.dirty {
+                                                        "●"
+                                                    } else {
+                                                        "×"
+                                                    })
+                                                    .frame(false),
+                                                )
+                                                .on_hover_text(tr("закрыть вкладку"))
+                                                .clicked()
+                                            {
+                                                close = Some(index);
+                                            }
+                                        });
+                                    });
+                            }
+                        });
+                    });
             });
-        ui.horizontal(|ui| {
-            if ui.button(tr("переименовать") + " · N / F2").clicked() {
-                self.begin_rename(ui.ctx());
-            }
-            ui.label(tr("поиск"));
-            ui.text_edit_singleline(&mut self.search);
-            if ui.button(tr("найти")).clicked() && !self.search.is_empty() {
-                if let Some(position) = self.documents[active].text.find(&self.search) {
-                    self.scroll_to_line = Some(
-                        self.documents[active].text[..position]
-                            .bytes()
-                            .filter(|b| *b == b'\n')
-                            .count(),
-                    );
+        if let Some(index) = close.filter(|_| self.source_save_rx.is_none()) {
+            if self.documents[index].dirty {
+                self.status = tr("сначала сохрани изменения файла");
+            } else {
+                self.documents.remove(index);
+                self.active = if self.documents.is_empty() {
+                    None
                 } else {
-                    self.status = tr("не найдено");
-                }
+                    Some(if index < active {
+                        active - 1
+                    } else {
+                        active.min(self.documents.len() - 1)
+                    })
+                };
+                return;
             }
-            if ui.button(tr("сохранить · ctrl+s")).clicked() {
-                self.save(false);
-            }
-        });
-        ui.separator();
+        }
+        egui::Frame::none()
+            .fill(Color32::from_gray(12))
+            .inner_margin(egui::Margin::symmetric(18.0, 5.0))
+            .show(ui, |ui| {
+                let path = self
+                    .output
+                    .as_ref()
+                    .and_then(|root| self.documents[active].path.strip_prefix(root).ok())
+                    .unwrap_or(&self.documents[active].path);
+                ui.label(
+                    egui::RichText::new(path.to_string_lossy().replace(['\\', '/'], "  ›  "))
+                        .size(12.0)
+                        .color(Color32::from_gray(145)),
+                );
+            });
         self.xref_panel(ui);
         self.constant_panel(ui, true);
+        let mut context_action = None;
         let doc = &mut self.documents[active];
-        ui.small(format!(
-            "{}  |  {} lines  |  {} bytes",
-            doc.path.display(),
-            doc.line_starts.len(),
-            doc.text.len()
-        ));
+        ui.painter().rect_filled(
+            ui.available_rect_before_wrap(),
+            0.0,
+            self.settings.theme.editor_color(),
+        );
         let mut scroll = egui::ScrollArea::both()
             .id_salt(("editor", active))
             .auto_shrink([false, false]);
         if let Some(line) = self.scroll_to_line.take() {
-            scroll = scroll.vertical_scroll_offset(line as f32 * 15.0);
+            scroll = scroll.vertical_scroll_offset(line as f32 * 20.0);
         }
         {
             let mut replacement = None;
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                scroll.show_rows(ui, 15.0, doc.line_starts.len(), |ui, rows| {
+                scroll.show_rows(ui, 20.0, doc.line_starts.len(), |ui, rows| {
                     self.visible_lines = (rows.start, rows.end);
                     if doc.line_cache.len() > 1024 {
                         doc.line_cache.clear();
@@ -1960,11 +2241,11 @@ impl Toker {
                             .clone();
                         ui.horizontal(|ui| {
                             ui.add_sized(
-                                [52.0, 15.0],
+                                [52.0, 20.0],
                                 egui::Label::new(
                                     RichText::new((line + 1).to_string())
                                         .monospace()
-                                        .size(13.0)
+                                        .size(14.0)
                                         .color(Color32::from_gray(100)),
                                 ),
                             );
@@ -1980,10 +2261,14 @@ impl Toker {
                                     ui.fonts(|fonts| fonts.layout_job(highlight(text)))
                                 };
                                 ui.add_sized(
-                                    [doc.max_columns.max(80) as f32 * 7.9, 15.0],
+                                    [doc.max_columns.max(80) as f32 * 7.9, 20.0],
                                     egui::TextEdit::multiline(&mut edited)
-                                        .id_salt(("uie-line", &doc.path, line))
-                                        .font(egui::FontId::monospace(13.0))
+                                        .interactive(
+                                            self.base_save_rx.is_none()
+                                                && self.source_save_rx.is_none(),
+                                        )
+                                        .id_salt(("uie-line", &doc.path, line, doc.history_epoch))
+                                        .font(egui::FontId::monospace(14.0))
                                         .margin(egui::Vec2::ZERO)
                                         .frame(false)
                                         .lock_focus(true)
@@ -1993,7 +2278,7 @@ impl Toker {
                                 )
                             } else {
                                 ui.add_sized(
-                                    [doc.max_columns.min(8192) as f32 * 7.9, 15.0],
+                                    [doc.max_columns.min(8192) as f32 * 7.9, 20.0],
                                     egui::Label::new(job).sense(egui::Sense::click()),
                                 )
                                 .on_hover_text(tr(
@@ -2011,17 +2296,37 @@ impl Toker {
                             if response.changed() {
                                 replacement = Some((start, start + original.len(), edited));
                             }
+                            response.context_menu(|ui| {
+                                use crate::workspace_chrome::Action;
+                                for (action, label) in [
+                                    (Action::Undo, "отменить правку"),
+                                    (Action::Redo, "повторить правку"),
+                                    (Action::Rename, "переименовать"),
+                                    (Action::Search, "поиск по проекту"),
+                                    (Action::SaveCode, "сохранить · ctrl+s"),
+                                ] {
+                                    if ui.button(tr(label)).clicked() {
+                                        context_action = Some(action);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                         });
                     }
                 });
             });
             if let Some((start, end, edited)) = replacement {
+                doc.history
+                    .record_range(start, &doc.text[start..end], &edited);
                 doc.text.replace_range(start..end, &edited);
                 doc.dirty = true;
                 doc.reindex();
                 self.base_dirty = true;
             }
             self.cursor_line = None;
+        }
+        if let Some(action) = context_action {
+            self.chrome_action(ui.ctx(), action);
         }
     }
 }
@@ -2076,7 +2381,7 @@ impl Toker {
                         report.hits.len()
                     ));
                     if report.truncated {
-                        ui.colored_label(Color32::YELLOW, tr("ограничение отчёта достигнуто"));
+                        ui.colored_label(Color32::LIGHT_GRAY, tr("ограничение отчёта достигнуто"));
                     }
                     let filter = self.ioc_filter.to_lowercase();
                     let rows: Vec<_> = report
@@ -2128,6 +2433,9 @@ impl Toker {
         self.rename_open = true;
     }
     fn rename_dialog(&mut self, ctx: &egui::Context) {
+        if self.base_save_rx.is_some() {
+            return;
+        }
         if !self.rename_open {
             return;
         }
@@ -2170,9 +2478,7 @@ impl Toker {
                         ) {
                             Ok((text, count)) if count > 0 => {
                                 let doc = &mut self.documents[index];
-                                doc.text = text;
-                                doc.dirty = true;
-                                doc.reindex();
+                                doc.replace_text(text);
                                 self.session.renames.push(crate::rename::Change {
                                     file: self
                                         .output
@@ -2206,16 +2512,18 @@ impl Toker {
         };
         let doc = &self.documents[index];
         egui::SidePanel::right("minimap")
-            .exact_width(100.0)
+            .exact_width(78.0)
             .resizable(false)
+            .frame(egui::Frame::none().fill(Color32::from_gray(10)))
             .show_inside(ui, |ui| {
                 let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(96.0, ui.available_height().max(100.0)),
+                    egui::vec2(76.0, ui.available_height().max(100.0)),
                     egui::Sense::click_and_drag(),
                 );
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 0.0, Color32::from_gray(19));
                 let count = doc.line_starts.len().max(1);
+                let line_height = (rect.height() / count as f32).min(2.0);
                 let samples = count.min((rect.height() as usize).clamp(1, 1500));
                 let mut mesh = egui::epaint::Mesh::default();
                 for sample in 0..samples {
@@ -2232,15 +2540,13 @@ impl Toker {
                         continue;
                     }
                     let indent = text.len() - trimmed.len();
-                    let y = rect.top() + line as f32 / count as f32 * rect.height();
+                    let y = rect.top() + line as f32 * line_height;
                     let left = rect.left() + (indent as f32 * 0.65).min(70.0);
                     let right = (left + trimmed.len().min(120) as f32 * 0.65).min(rect.right());
                     let color = if trimmed.starts_with(['#', '/']) {
-                        Color32::from_rgb(95, 130, 95)
-                    } else if trimmed.contains(['"', '\'']) {
-                        Color32::from_rgb(171, 143, 96)
+                        Color32::from_gray(120)
                     } else {
-                        Color32::from_rgb(111, 153, 181)
+                        Color32::from_gray(146)
                     };
                     mesh.add_colored_rect(
                         egui::Rect::from_min_max(egui::pos2(left, y), egui::pos2(right, y + 0.8)),
@@ -2248,23 +2554,22 @@ impl Toker {
                     );
                 }
                 painter.add(egui::Shape::mesh(mesh));
-                let top = rect.top() + self.visible_lines.0 as f32 / count as f32 * rect.height();
-                let bottom = (rect.top()
-                    + self.visible_lines.1 as f32 / count as f32 * rect.height())
-                .max(top + 5.0)
-                .min(rect.bottom());
+                let top = rect.top() + self.visible_lines.0 as f32 * line_height;
+                let bottom = (rect.top() + self.visible_lines.1 as f32 * line_height)
+                    .max(top + 5.0)
+                    .min(rect.bottom());
                 painter.rect_filled(
                     egui::Rect::from_min_max(
                         egui::pos2(rect.left(), top.min(rect.bottom() - 5.0)),
                         egui::pos2(rect.right(), bottom),
                     ),
                     2.0,
-                    Color32::from_rgba_unmultiplied(160, 160, 160, 65),
+                    Color32::from_rgba_unmultiplied(160, 160, 160, 22),
                 );
                 if response.clicked() || response.dragged() {
                     if let Some(point) = response.interact_pointer_pos() {
-                        let line = (((point.y - rect.top()) / rect.height()).clamp(0.0, 1.0)
-                            * count as f32) as usize;
+                        let line =
+                            ((point.y - rect.top()) / line_height.max(0.001)).max(0.0) as usize;
                         self.scroll_to_line = Some(line.min(count - 1));
                         self.cursor_line = self.scroll_to_line;
                     }
@@ -2282,7 +2587,7 @@ fn highlight(text: &str) -> egui::text::LayoutJob {
         position += current.len_utf8();
         let color = if current == '#' || text[start..].starts_with("//") {
             position = text[start..].find('\n').map_or(text.len(), |n| start + n);
-            Color32::from_rgb(115, 133, 140)
+            Color32::from_gray(130)
         } else if current == '\'' || current == '"' {
             let mut escaped = false;
             for ch in text[position..].chars() {
@@ -2292,7 +2597,7 @@ fn highlight(text: &str) -> egui::text::LayoutJob {
                 }
                 escaped = ch == '\\' && !escaped;
             }
-            Color32::from_rgb(166, 215, 151)
+            Color32::from_gray(200)
         } else if current.is_alphabetic() || current == '_' {
             for ch in text[position..].chars() {
                 if !(ch.is_alphanumeric() || ch == '_') {
@@ -2352,13 +2657,13 @@ fn highlight(text: &str) -> egui::text::LayoutJob {
             ]
             .contains(&&text[start..position])
             {
-                Color32::from_rgb(137, 179, 242)
+                Color32::from_gray(175)
             } else if ["True", "False", "None", "true", "false", "null"]
                 .contains(&&text[start..position])
             {
-                Color32::from_rgb(210, 166, 232)
+                Color32::from_gray(180)
             } else {
-                Color32::from_rgb(218, 224, 232)
+                Color32::from_gray(223)
             }
         } else if current.is_ascii_digit() {
             for ch in text[position..].chars() {
@@ -2367,9 +2672,9 @@ fn highlight(text: &str) -> egui::text::LayoutJob {
                 }
                 position += ch.len_utf8();
             }
-            Color32::from_rgb(238, 189, 124)
+            Color32::from_gray(195)
         } else {
-            Color32::from_rgb(218, 224, 232)
+            Color32::from_gray(223)
         };
         job.append(
             &text[start..position],
@@ -2385,6 +2690,309 @@ fn highlight(text: &str) -> egui::text::LayoutJob {
 }
 
 // Context accessors lock the same egui state. Never call one inside input_mut.
+impl Toker {
+    fn recovery_ui(&mut self, ctx: &egui::Context) {
+        use crate::editor_recovery::Event;
+        for event in self.recovery.poll() {
+            match event {
+                Event::Candidates(values) => {
+                    self.recovery_candidates = values;
+                    self.recovery_open = !self.recovery_candidates.is_empty();
+                }
+                Event::Loaded { candidate, text } => {
+                    if self
+                        .documents
+                        .iter()
+                        .any(|doc| doc.path == candidate.path && doc.dirty)
+                    {
+                        self.status = tr("сначала сохрани изменения файла");
+                        continue;
+                    }
+                    let index = if let Some(index) = self
+                        .documents
+                        .iter()
+                        .position(|doc| doc.path == candidate.path)
+                    {
+                        self.documents[index].replace_text(text);
+                        index
+                    } else {
+                        self.documents
+                            .push(Document::new(candidate.path.clone(), text));
+                        self.documents.len() - 1
+                    };
+                    let doc = &mut self.documents[index];
+                    doc.baseline_sha256 = candidate.baseline_sha256;
+                    doc.revision = candidate.revision.saturating_add(1);
+                    doc.dirty = true;
+                    // Recovered text always saves to a new copy; original evidence stays intact.
+                    doc.recovery_conflict = true;
+                    self.active = Some(index);
+                    self.tab = 0;
+                    self.base_dirty = true;
+                    self.recovery_candidates.retain(|c| c.id != candidate.id);
+                    self.recovery_open = !self.recovery_candidates.is_empty();
+                    self.status = tr("черновик восстановлен сохранение создаст новую копию");
+                }
+                Event::Error { path, message } => {
+                    self.status = format!(
+                        "{}: {}{}",
+                        tr("автосохранение"),
+                        path.map(|p| format!("{}: ", p.display()))
+                            .unwrap_or_default(),
+                        message
+                    );
+                }
+            }
+        }
+        if self.settings.autosave && self.documents.iter().any(|d| d.dirty) {
+            ctx.request_repaint_after(Duration::from_secs(5));
+            if self.recovery.due() {
+                for doc in self.documents.iter().filter(|d| d.dirty) {
+                    if let Err(error) =
+                        self.recovery
+                            .save(&doc.path, doc.revision, &doc.baseline_sha256, &doc.text)
+                    {
+                        self.status = error;
+                    }
+                }
+            }
+        }
+        if !self.recovery_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(tr("восстановление черновиков"))
+            .open(&mut open)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label(tr(
+                    "восстановление открывает текст в редакторе исходные файлы не меняются",
+                ));
+                egui::ScrollArea::vertical()
+                    .max_height(330.0)
+                    .show(ui, |ui| {
+                        for candidate in &self.recovery_candidates {
+                            ui.group(|ui| {
+                                ui.label(candidate.path.display().to_string());
+                                ui.weak(format!(
+                                    "{} bytes{}",
+                                    candidate.bytes,
+                                    if candidate.conflict {
+                                        format!(" · {}", tr("исходник изменён или отсутствует"))
+                                    } else {
+                                        String::new()
+                                    }
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui.button(tr("восстановить")).clicked() {
+                                        if let Err(e) = self.recovery.load(&candidate.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                    if ui.button(tr("удалить черновик")).clicked() {
+                                        if let Err(e) = self.recovery.discard(&candidate.id) {
+                                            self.status = e;
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    });
+            });
+        self.recovery_open &= open;
+    }
+
+    fn chrome_action(&mut self, ctx: &egui::Context, action: crate::workspace_chrome::Action) {
+        use crate::workspace_chrome::Action;
+        if self.source_save_rx.is_some()
+            && matches!(action, Action::Undo | Action::Redo | Action::Rename)
+        {
+            return;
+        }
+        match action {
+            Action::Open => {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    self.start(path);
+                }
+            }
+            Action::Load => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(tr("база UIE"), &["uie", "toker"])
+                    .pick_file()
+                {
+                    self.start(path);
+                }
+            }
+            Action::Save => {
+                self.save_base();
+            }
+            Action::SaveCode => {
+                self.save(false);
+            }
+            Action::Folder => {
+                if let Some(path) = &self.output {
+                    if let Err(e) = engine::open_folder(path) {
+                        self.status = e;
+                    }
+                }
+            }
+            Action::Undo | Action::Redo => {
+                if let Some(i) = self.active {
+                    if self.documents[i].navigate_history(action == Action::Redo) {
+                        self.base_dirty = true;
+                    }
+                }
+            }
+            Action::Search => self.analysis_tools.open_tab(0),
+            Action::Graph => self.analysis_tools.open_tab(1),
+            Action::Compare => self.analysis_tools.open_tab(2),
+            Action::Settings => self.analysis_tools.open_settings(),
+            Action::Plugins => self.plugin_manager.open = true,
+            Action::CompareBases => self.compare_bases(),
+            Action::CachedBase => {
+                let primary = crate::project::app_root()
+                    .join("projects")
+                    .join(format!("{}.uie", self.input_hash));
+                let legacy = primary.with_extension("toker");
+                let base = if primary.is_file() { primary } else { legacy };
+                if base.is_file() {
+                    self.start(base);
+                } else {
+                    self.status = tr("не найдено");
+                }
+            }
+            Action::Background => self.analysis_tools.open_tab(4),
+            Action::Rename => self.begin_rename(ctx),
+            Action::Rebuild => {
+                if let Some(path) = self.input.clone() {
+                    self.settings.force_rebuild = true;
+                    self.start(path);
+                    self.settings.force_rebuild = false;
+                }
+            }
+            Action::Stop => {
+                self.cancel.store(true, Ordering::Relaxed);
+                self.status = tr("остановка…");
+            }
+            Action::Project => self.chrome.project = !self.chrome.project,
+            Action::Stages => self.tab = 1,
+            Action::Report => self.tab = 2,
+            Action::Log => self.tab = 3,
+            Action::Symbols => self.export_debugger_symbols(),
+            Action::Crash => self.crash_assistant.reload(self.log_file.clone(), true),
+            Action::About => self.about.open = true,
+            Action::Update => {
+                if self.update_rx.is_none() {
+                    self.update_checked = true;
+                    self.update_rx = Some(crate::updater::start_check());
+                    self.status = tr("проверка обновлений");
+                }
+            }
+            Action::Language => {
+                self.settings.english = !self.settings.english;
+                crate::language::set(self.settings.english);
+                if let Err(e) = self.settings.save() {
+                    self.status = e;
+                }
+            }
+            Action::Offline => {
+                self.settings.offline = !self.settings.offline;
+                crate::runtime::set_offline(self.settings.offline);
+                if let Err(e) = self.settings.save() {
+                    self.status = e;
+                }
+            }
+            Action::Bundle => self.offline_options = true,
+            Action::Debugger => {
+                if cfg!(windows) && self.debugger_rx.is_none() {
+                    let architecture = self
+                        .analysis
+                        .as_ref()
+                        .map(|a| a.architecture.clone())
+                        .unwrap_or_else(|| "x64".into());
+                    let offline = self.settings.offline;
+                    let (tx, rx) = mpsc::channel();
+                    self.debugger_rx = Some(rx);
+                    self.status = tr("подготовка отладчика");
+                    thread::spawn(move || {
+                        let _ = tx.send(crate::debugger::prepare(&architecture, offline));
+                    });
+                }
+            }
+            Action::Palette => self.chrome.open_palette(),
+            Action::Inspection => self.inspection.open = true,
+            Action::Reports => self.report_tools.open = true,
+            Action::Dynamic => self.dynamic_analysis.open = true,
+            Action::Hex => {
+                self.hex.open = true;
+                if let Some(path) = self.input.as_ref().filter(|p| !telemetry::is_base(p)) {
+                    self.hex.open_path(path.clone());
+                }
+            }
+            Action::Recovery => {
+                self.recovery_open = true;
+                if let Err(e) = self.recovery.refresh() {
+                    self.status = e;
+                }
+            }
+        }
+    }
+    fn offline_options(&mut self, ctx: &egui::Context) {
+        if !self.offline_options {
+            return;
+        }
+        let mut open = true;
+        let mut download = false;
+        egui::Window::new(tr("скачать офлайн-комплект"))
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                egui::ComboBox::from_id_salt("offline-python")
+                    .selected_text(if self.offline_versions == "all" {
+                        tr("все версии python")
+                    } else {
+                        format!("Python {}", self.offline_versions)
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.offline_versions,
+                            "all".into(),
+                            tr("все версии python"),
+                        );
+                        for version in ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"] {
+                            ui.selectable_value(
+                                &mut self.offline_versions,
+                                version.into(),
+                                version,
+                            );
+                        }
+                    });
+                ui.label(tr(
+                    "движки и модели сохраняются в engines; все версии требуют несколько гигабайт",
+                ));
+                download = ui
+                    .add_enabled(!self.busy, egui::Button::new(tr("скачать офлайн-комплект")))
+                    .clicked();
+            });
+        self.offline_options = open;
+        if download {
+            self.offline_options = false;
+            self.settings.offline = false;
+            crate::runtime::set_offline(false);
+            let _ = self.settings.save();
+            self.busy = true;
+            self.cancel = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = mpsc::channel();
+            self.receiver = Some(rx);
+            let settings = self.settings.clone();
+            let versions = self.offline_versions.clone();
+            let cancel = self.cancel.clone();
+            self.status = tr("подготовка офлайн-комплекта");
+            thread::spawn(move || crate::runtime::prepare_offline(settings, versions, cancel, tx));
+        }
+    }
+}
+
 fn consume_rename_shortcut(ctx: &egui::Context, editor_focused: bool) -> bool {
     let allow_n = editor_focused || !ctx.wants_keyboard_input();
     ctx.input_mut(|input| {
@@ -2394,9 +3002,45 @@ fn consume_rename_shortcut(ctx: &egui::Context, editor_focused: bool) -> bool {
 }
 
 impl eframe::App for Toker {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(background), Some(gl)) = (self.background.take(), gl) {
+            background.destroy(gl);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         crate::language::set(self.settings.english);
+        self.settings.theme.apply(ctx);
         self.poll();
+        self.recovery_ui(ctx);
+        self.hex.show(ctx);
+        self.report_tools.show(ctx, self.output.clone());
+        self.dynamic_analysis
+            .show(ctx, self.input.clone(), self.output.clone());
+        self.plugin_manager.show(ctx);
+        if let Some(problem) = self.inspection.show(ctx, self.output.clone()) {
+            self.jump_to_problem(&problem);
+        }
+        if let Some(background) = &self.background {
+            background.paint(ctx, &self.settings.background);
+        } else if self.settings.background.animated {
+            crate::background::paint_static(ctx);
+        } else {
+            crate::background::paint_disabled(ctx);
+        }
+        self.crash_assistant.show(ctx, self.settings.english);
+        if self.update_after_save
+            && self.base_save_rx.is_none()
+            && !self.busy
+            && !self.has_unsaved()
+        {
+            self.update_after_save = false;
+            if self.downloaded_update.is_some() {
+                self.apply_update(ctx);
+            } else if let Some(release) = self.available_update.clone() {
+                self.update_rx = Some(crate::updater::start_download(release));
+            }
+        }
         self.updates(ctx);
         self.debugger_dialog(ctx);
         self.rename_dialog(ctx);
@@ -2428,10 +3072,18 @@ impl eframe::App for Toker {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label(tr("сохранить изменения перед закрытием?"));
-                    if ui.button(tr("сохранить базу и закрыть")).clicked() && self.save_base()
+                    if ui
+                        .add_enabled(
+                            !self.busy,
+                            egui::Button::new(tr("сохранить базу и закрыть")),
+                        )
+                        .clicked()
                     {
-                        self.allow_close = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.save_base();
+                        if self.saves_in_progress() {
+                            self.confirm_close = false;
+                            self.close_after_cancel = true;
+                        }
                     }
                     if ui.button(tr("закрыть без сохранения")).clicked() {
                         self.allow_close = true;
@@ -2464,342 +3116,379 @@ impl eframe::App for Toker {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
             self.save(false);
         }
+        if self.tab == 0
+            && self.editor_focused
+            && !self.rename_open
+            && self.base_save_rx.is_none()
+            && self.source_save_rx.is_none()
+        {
+            let action = ctx.input_mut(|input| {
+                if input.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                ) || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                {
+                    Some(true)
+                } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            if let (Some(redo), Some(index)) = (action, self.active) {
+                if self.documents[index].navigate_history(redo) {
+                    self.base_dirty = true;
+                }
+            }
+        }
+        self.editor_focused = false;
         if self.busy
             || self.workspace_rx.is_some()
             || self.project_rx.is_some()
             || self.document_rx.is_some()
             || self.lazy_rx.is_some()
             || self.utility_rx.is_some()
+            || self.base_save_rx.is_some()
             || self.debugger_rx.is_some()
             || self.update_rx.is_some()
         {
-            ctx.request_repaint_after(Duration::from_millis(150));
+            ctx.request_repaint_after(Duration::from_millis(
+                if ctx.input(|input| input.viewport().minimized.unwrap_or(false)) {
+                    1000
+                } else {
+                    150
+                },
+            ));
         }
-        egui::TopBottomPanel::top("toolbar")
-            .min_height(50.0)
+        if ctx.input(|input| input.viewport().minimized.unwrap_or(false)) {
+            return;
+        }
+        let name = self
+            .input
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "{}{}",
+                    p.file_name().unwrap_or_default().to_string_lossy(),
+                    if self.has_unsaved() { " *" } else { "" }
+                )
+            })
+            .unwrap_or_else(|| "Unpack It Easy".into());
+        let state = crate::workspace_chrome::State {
+            english: self.settings.english,
+            avatar: self._avatar.id(),
+            busy: self.busy,
+            output: self.output.is_some(),
+            input: self.input.as_ref().is_some_and(|p| !telemetry::is_base(p)),
+            undo: self
+                .active
+                .is_some_and(|i| self.documents[i].history.can_undo()),
+            redo: self
+                .active
+                .is_some_and(|i| self.documents[i].history.can_redo()),
+            offline: self.settings.offline,
+            name: &name,
+        };
+        for action in self.chrome.show(ctx, state) {
+            self.chrome_action(ctx, action);
+        }
+        self.offline_options(ctx);
+        egui::TopBottomPanel::bottom("statusbar")
+            .exact_height(28.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_gray(28))
+                    .inner_margin(egui::Margin::symmetric(12.0, 5.0)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.image((self.avatar.id(), egui::vec2(30.0, 30.0)));
-                    ui.heading(RichText::new("UIE").color(Color32::from_rgb(235, 238, 241)));
-                    if ui.add_enabled(!self.settings.offline && self.update_rx.is_none(),egui::Button::new(tr("проверить обновления"))).clicked(){
-                        self.update_checked=true;self.update_rx=Some(crate::updater::start_check());
-                        self.status=tr("проверка обновлений");
+                ui.horizontal(|ui| {
+                    if self.busy {
+                        ui.spinner();
+                    } else {
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter()
+                            .circle_filled(r.center(), 3.0, Color32::from_gray(185));
                     }
-                    if ui.button(tr("о программе")).clicked(){self.about.open=true;}
-                    if cfg!(windows) && ui.add_enabled(!self.busy&&self.debugger_rx.is_none(),egui::Button::new("x64dbg / x32dbg")).clicked(){
-                        let architecture=self.analysis.as_ref().map(|a|a.architecture.clone()).unwrap_or_else(||"x64".into());let offline=self.settings.offline;
-                        let(tx,rx)=mpsc::channel();self.debugger_rx=Some(rx);self.status=tr("подготовка отладчика");thread::spawn(move||{let _=tx.send(crate::debugger::prepare(&architecture,offline));});
-                    }
-                    let previous = self.settings.english;
-                    egui::ComboBox::from_id_salt("language")
-                        .selected_text(if self.settings.english {
-                            "English"
-                        } else {
-                            "русский"
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.settings.english, false, "русский");
-                            ui.selectable_value(&mut self.settings.english, true, "English");
-                        });
-                    if ui.add_enabled(!self.busy,egui::Checkbox::new(&mut self.settings.offline,tr("офлайн"))).changed(){
-                        crate::runtime::set_offline(self.settings.offline);let _=self.settings.save();
-                    }
-                    egui::ComboBox::from_id_salt("offline-versions").selected_text(if self.offline_versions=="all"{tr("все версии python")}else{format!("Python {}",self.offline_versions)}).show_ui(ui,|ui|{
-                        ui.selectable_value(&mut self.offline_versions,"all".into(),tr("все версии python"));
-                        for version in ["3.8","3.9","3.10","3.11","3.12","3.13","3.14"]{ui.selectable_value(&mut self.offline_versions,version.into(),version);}
-                    });
-                    if ui.add_enabled(!self.busy,egui::Button::new(tr("скачать офлайн-комплект"))).on_hover_text(tr("движки и модели сохраняются в engines; все версии требуют несколько гигабайт")).clicked(){
-                        self.settings.offline=false;let _=self.settings.save();self.busy=true;
-                        self.cancel=Arc::new(AtomicBool::new(false));
-                        let (tx,rx)=mpsc::channel();self.receiver=Some(rx);
-                        let settings=self.settings.clone();let versions=self.offline_versions.clone();let cancel=self.cancel.clone();
-                        self.status=tr("подготовка офлайн-комплекта");
-                        thread::spawn(move||crate::runtime::prepare_offline(settings,versions,cancel,tx));
-                    }
-                    if previous != self.settings.english {
-                        crate::language::set(self.settings.english);
-                        let _ = self.settings.save();
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new(tr("открыть файл")))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.start(path);
-                        }
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new(tr("загрузить базу")))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(tr("база UIE"), &["uie", "toker"])
-                            .pick_file()
-                        {
-                            self.start(path);
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.busy && self.output.is_some(),
-                            egui::Button::new(tr("сохранить базу")),
-                        )
-                        .clicked()
-                    {
-                        self.save_base();
-                    }
-                    if self.busy && ui.button(tr("остановить")).clicked() {
-                        self.cancel.store(true, Ordering::Relaxed);
-                        self.status = tr("остановка…");
-                    }
-                    if !self.busy
-                        && !self.input_hash.is_empty()
-                        && self.input.as_ref().is_some_and(|p| !telemetry::is_base(p))
-                    {
-                        let primary = crate::project::app_root()
-                            .join("projects")
-                            .join(format!("{}.uie", self.input_hash));
-                        let legacy = primary.with_extension("toker");
-                        let base = if primary.is_file() { primary } else { legacy };
-                        if base.is_file() && ui.button(tr("проверенная база")).clicked()
-                        {
-                            self.start(base);
-                        }
-                    }
-                    if !self.busy
-                        && self.input.as_ref().is_some_and(|p| !telemetry::is_base(p))
-                        && ui.button(tr("декомпилировать заново")).clicked()
-                    {
-                        let input = self.input.clone().unwrap();
-                        self.settings.force_rebuild = true;
-                        self.start(input);
-                        self.settings.force_rebuild = false;
-                    }
-                    if let Some(output) = &self.output {
-                        if ui.button(tr("каталог результата")).clicked() {
-                            if let Err(e) = engine::open_folder(output) {
-                                self.status = e;
-                            }
-                        }
-                    }
-                    if let Some(input) = &self.input {
-                        ui.label(format!(
-                            "{}{}",
-                            input.file_name().unwrap_or_default().to_string_lossy(),
-                            if self.has_unsaved() { " *" } else { "" }
-                        ));
-                    }
-                });
-            });
-        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if self.busy {
-                    ui.spinner();
-                }
-                ui.label(tr(&self.status));
-            });
-        });
-        let mut lazy_requested = None;
-        egui::SidePanel::left("navigation")
-            .default_width(250.0)
-            .min_width(190.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading(tr("проект"));
-                if let Some(a) = &self.analysis {
-                    ui.label(format!("{} / {}", a.format, a.architecture));
-                    ui.small(a.route.label().replace('→', "->"));
-                    if let Some(v) = &a.python_version {
-                        ui.label(format!("python {v}"));
-                    }
-                }
-                ui.separator();
-                ui.add_enabled_ui(!self.busy, |ui| {
-                    ui.checkbox(&mut self.settings.all_modules, tr("включая все модули"));
-                    if ui
-                        .checkbox(
-                            &mut self.settings.lazy_native,
-                            tr("ленивая декомпиляция native"),
-                        )
-                        .changed()
-                    {
-                        let _ = self.settings.save();
-                    }
-                });
-                ui.add_enabled_ui(!self.busy && self.utility_rx.is_none(), |ui| {
-                    if ui.button(tr("экспорт символов x64dbg")).clicked() {
-                        self.export_debugger_symbols();
-                    }
-                    if ui.button(tr("сравнить две базы")).clicked() {
-                        self.compare_bases();
-                    }
-                });
-                ui.separator();
-                ui.label(tr("исходники"));
-                let mut selected = None;
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        for path in &self.files {
-                            let label = self
-                                .output
-                                .as_ref()
-                                .and_then(|o| path.strip_prefix(o).ok())
-                                .unwrap_or(path)
-                                .to_string_lossy();
-                            if ui
-                                .selectable_label(
-                                    self.active.is_some_and(|i| self.documents[i].path == *path),
-                                    label,
-                                )
-                                .clicked()
-                            {
-                                selected = Some(path.clone());
-                            }
-                        }
-                    });
-                if let Some(path) = selected {
-                    self.open_document(path);
-                }
-                if let Some(index) = self.active {
-                    ui.separator();
-                    ui.label(tr("функции и классы"));
-                    egui::ScrollArea::vertical()
-                        .id_salt("symbols")
-                        .show(ui, |ui| {
-                            let native = self.documents[index]
-                                .path
-                                .extension()
-                                .is_some_and(|e| e == "c" || e == "cpp" || e == "h" || e == "hpp");
-                            for group in if native {
-                                vec![Some(true), Some(false)]
-                            } else {
-                                vec![None]
-                            } {
-                                let rows: Vec<_> = self.documents[index]
-                                    .symbols
-                                    .iter()
-                                    .filter(|(_, _, user)| group.is_none_or(|group| *user == group))
-                                    .collect();
-                                let mut render = |ui: &mut egui::Ui| {
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(("symbol-group", group))
-                                        .max_height(300.0)
-                                        .show_rows(ui, 18.0, rows.len(), |ui, range| {
-                                            for row in range {
-                                                let (line, symbol, _) = rows[row];
-                                                if ui.selectable_label(false, symbol).clicked() {
-                                                    lazy_requested = Some((
-                                                        self.documents[index].path.clone(),
-                                                        *line,
-                                                    ));
-                                                    self.scroll_to_line = Some(*line);
-                                                    self.cursor_line = Some(*line);
-                                                    self.tab = 0;
-                                                }
-                                            }
-                                        });
-                                };
-                                if let Some(user) = group {
-                                    egui::CollapsingHeader::new(format!(
-                                        "{} ({})",
-                                        if user {
-                                            tr("пользовательские / nuitka")
-                                        } else {
-                                            tr("остальные")
-                                        },
-                                        rows.len()
-                                    ))
-                                    .default_open(user)
-                                    .show(ui, render);
+                    let status = if self.status.is_empty() {
+                        tr("готово")
+                    } else {
+                        tr(&self.status)
+                    };
+                    ui.add(egui::Label::new(&status).truncate())
+                        .on_hover_text(&status);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let language = self
+                            .active
+                            .and_then(|i| self.documents[i].path.extension())
+                            .map(|e| e.to_string_lossy().to_uppercase())
+                            .unwrap_or_default();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "UTF-8  ·  {language}  ·  {}",
+                                if self.settings.offline {
+                                    tr("офлайн")
                                 } else {
-                                    render(ui);
+                                    tr("онлайн")
+                                }
+                            ))
+                            .color(Color32::from_gray(160)),
+                        );
+                    });
+                });
+            });
+        let mut lazy_requested = None;
+        if self.chrome.project {
+            egui::SidePanel::left("navigation")
+                .default_width(250.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(egui::Margin::symmetric(10.0, 10.0)),
+                )
+                .min_width(190.0)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.heading(tr("проект"));
+                    egui::CollapsingHeader::new(tr("сведения"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            if let Some(a) = &self.analysis {
+                                ui.label(format!("{} / {}", a.format, a.architecture));
+                                ui.small(a.route.label().replace('→', "->"));
+                                if let Some(v) = &a.python_version {
+                                    ui.label(format!("python {v}"));
                                 }
                             }
                         });
-                }
-            });
+                    ui.add_space(12.0);
+                    let mut selected = None;
+                    egui::CollapsingHeader::new(tr("исходники"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(260.0)
+                                .show(ui, |ui| {
+                                    for path in &self.files {
+                                        let label = self
+                                            .output
+                                            .as_ref()
+                                            .and_then(|o| path.strip_prefix(o).ok())
+                                            .unwrap_or(path)
+                                            .to_string_lossy();
+                                        if ui
+                                            .selectable_label(
+                                                self.active.is_some_and(|i| {
+                                                    self.documents[i].path == *path
+                                                }),
+                                                path.file_name()
+                                                    .unwrap_or_default()
+                                                    .to_string_lossy(),
+                                            )
+                                            .on_hover_text(label.to_string())
+                                            .clicked()
+                                        {
+                                            selected = Some(path.clone());
+                                        }
+                                    }
+                                });
+                        });
+                    if let Some(path) = selected {
+                        self.open_document(path);
+                    }
+                    if let Some(index) = self.active {
+                        ui.add_space(10.0);
+                        egui::CollapsingHeader::new(tr("функции и классы"))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("symbols")
+                                    .show(ui, |ui| {
+                                        let native = self.documents[index]
+                                            .path
+                                            .extension()
+                                            .is_some_and(|e| {
+                                                e == "c" || e == "cpp" || e == "h" || e == "hpp"
+                                            });
+                                        for group in if native {
+                                            vec![Some(true), Some(false)]
+                                        } else {
+                                            vec![None]
+                                        } {
+                                            let rows: Vec<_> = self.documents[index]
+                                                .symbols
+                                                .iter()
+                                                .filter(|(_, _, user)| {
+                                                    group.is_none_or(|group| *user == group)
+                                                })
+                                                .collect();
+                                            let mut render = |ui: &mut egui::Ui| {
+                                                egui::ScrollArea::vertical()
+                                                    .id_salt(("symbol-group", group))
+                                                    .max_height(300.0)
+                                                    .show_rows(
+                                                        ui,
+                                                        18.0,
+                                                        rows.len(),
+                                                        |ui, range| {
+                                                            for row in range {
+                                                                let (line, symbol, _) = rows[row];
+                                                                if ui
+                                                                    .selectable_label(false, symbol)
+                                                                    .clicked()
+                                                                {
+                                                                    lazy_requested = Some((
+                                                                        self.documents[index]
+                                                                            .path
+                                                                            .clone(),
+                                                                        *line,
+                                                                    ));
+                                                                    self.scroll_to_line =
+                                                                        Some(*line);
+                                                                    self.cursor_line = Some(*line);
+                                                                    self.tab = 0;
+                                                                }
+                                                            }
+                                                        },
+                                                    );
+                                            };
+                                            if let Some(user) = group {
+                                                egui::CollapsingHeader::new(format!(
+                                                    "{} ({})",
+                                                    if user {
+                                                        tr("пользовательские / nuitka")
+                                                    } else {
+                                                        tr("остальные")
+                                                    },
+                                                    rows.len()
+                                                ))
+                                                .default_open(user)
+                                                .show(ui, render);
+                                            } else {
+                                                render(ui);
+                                            }
+                                        }
+                                    });
+                            });
+                    }
+                });
+        }
         if let Some((path, line)) = lazy_requested {
             self.request_lazy(path, line);
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for (index, name) in [tr("код"), tr("этапы"), tr("отчёт"), tr("лог")]
-                    .iter()
-                    .enumerate()
-                {
-                    if ui.selectable_label(self.tab == index, tr(name)).clicked() {
-                        self.tab = index;
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin::same(8.0)),
+            )
+            .show(ctx, |ui| {
+                if self.analysis_tools.open {
+                    let edited = self
+                        .documents
+                        .iter()
+                        .filter(|d| d.dirty)
+                        .map(|d| (d.path.clone(), d.text.clone()))
+                        .collect();
+                    if let Some(problem) = self.analysis_tools.show(
+                        ui,
+                        self.output.clone(),
+                        &mut self.settings,
+                        edited,
+                    ) {
+                        self.analysis_tools.open = false;
+                        self.jump_to_problem(&problem);
+                    }
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    for (index, name) in [tr("код"), tr("этапы"), tr("отчёт"), tr("лог")]
+                        .iter()
+                        .enumerate()
+                    {
+                        if ui.selectable_label(self.tab == index, tr(name)).clicked() {
+                            self.tab = index;
+                        }
+                    }
+                });
+                ui.separator();
+                match self.tab {
+                    0 => {
+                        if self.active.is_some() {
+                            egui::Frame::none()
+                                .fill(self.settings.theme.editor_color())
+                                .show(ui, |ui| {
+                                    self.editor(ui);
+                                });
+                        } else {
+                            self.editor(ui);
+                        }
+                    }
+                    1 => {
+                        self.progress(ui);
+                        self.hash_panel(ui);
+                    }
+                    2 => {
+                        self.problem_links(ui);
+                        self.native_report_panel(ui);
+                        self.indicator_panel(ui);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if let Some(a) = &self.analysis {
+                                ui.monospace(tr(
+                                    &serde_json::to_string_pretty(a).unwrap_or_default()
+                                ));
+                            } else {
+                                ui.label(tr("отчёт появится после анализа"));
+                            }
+                        });
+                    }
+                    _ => {
+                        ui.horizontal(|ui| {
+                            if ui.button(tr("экспорт лога")).clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter(tr("журнал"), &["log", "txt"])
+                                    .set_file_name("uie.log")
+                                    .save_file()
+                                {
+                                    match fs::write(&path, tr(&self.full_log())) {
+                                        Ok(()) => {
+                                            self.status =
+                                                tr(&format!("лог сохранён: {}", path.display()))
+                                        }
+                                        Err(error) => self.status = error.to_string(),
+                                    }
+                                }
+                            }
+                            if ui.button(tr("скопировать лог")).clicked() {
+                                ui.ctx().copy_text(tr(&self.full_log()));
+                                self.status = tr("лог скопирован");
+                            }
+                        });
+                        self.problem_links(ui);
+                        egui::ScrollArea::both()
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                let lines: Vec<_> = self.logs.lines().collect();
+                                egui::ScrollArea::vertical().id_salt("log-lines").show_rows(
+                                    ui,
+                                    15.0,
+                                    lines.len(),
+                                    |ui, range| {
+                                        for row in range {
+                                            let text = lines[row];
+                                            let end = text
+                                                .char_indices()
+                                                .nth(8192)
+                                                .map(|(i, _)| i)
+                                                .unwrap_or(text.len());
+                                            ui.monospace(tr(&text[..end]));
+                                        }
+                                    },
+                                );
+                            });
                     }
                 }
             });
-            ui.separator();
-            match self.tab {
-                0 => self.editor(ui),
-                1 => {
-                    self.progress(ui);
-                    self.hash_panel(ui);
-                }
-                2 => {
-                    self.problem_links(ui);
-                    self.native_report_panel(ui);
-                    self.indicator_panel(ui);
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if let Some(a) = &self.analysis {
-                            ui.monospace(tr(&serde_json::to_string_pretty(a).unwrap_or_default()));
-                        } else {
-                            ui.label(tr("отчёт появится после анализа"));
-                        }
-                    });
-                }
-                _ => {
-                    ui.horizontal(|ui| {
-                        if ui.button(tr("экспорт лога")).clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter(tr("журнал"), &["log", "txt"])
-                                .set_file_name("uie.log")
-                                .save_file()
-                            {
-                                match fs::write(&path, tr(&self.full_log())) {
-                                    Ok(()) => {
-                                        self.status =
-                                            tr(&format!("лог сохранён: {}", path.display()))
-                                    }
-                                    Err(error) => self.status = error.to_string(),
-                                }
-                            }
-                        }
-                        if ui.button(tr("скопировать лог")).clicked() {
-                            ui.ctx().copy_text(tr(&self.full_log()));
-                            self.status = tr("лог скопирован");
-                        }
-                    });
-                    self.problem_links(ui);
-                    egui::ScrollArea::both()
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            let lines: Vec<_> = self.logs.lines().collect();
-                            egui::ScrollArea::vertical().id_salt("log-lines").show_rows(
-                                ui,
-                                15.0,
-                                lines.len(),
-                                |ui, range| {
-                                    for row in range {
-                                        let text = lines[row];
-                                        let end = text
-                                            .char_indices()
-                                            .nth(8192)
-                                            .map(|(i, _)| i)
-                                            .unwrap_or(text.len());
-                                        ui.monospace(tr(&text[..end]));
-                                    }
-                                },
-                            );
-                        });
-                }
-            }
-        });
         self.about.show(ctx);
     }
 }
@@ -2814,6 +3503,137 @@ impl Drop for Toker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovered_source_is_saved_asynchronously_and_included_in_database() {
+        let context = egui::Context::default();
+        let avatar = context.load_texture(
+            "recovered-save",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        let root = std::env::temp_dir().join(format!("uie-recovered-base-{}", std::process::id()));
+        fs::create_dir_all(root.join("source")).unwrap();
+        let original = root.join("source/app.py");
+        fs::write(&original, "old").unwrap();
+        let mut doc = Document::new(original.clone(), "recovered".into());
+        doc.dirty = true;
+        doc.recovery_conflict = true;
+        app.documents.push(doc);
+        app.active = Some(0);
+        app.output = Some(root.clone());
+        app.analysis = Some(crate::detect::inspect(b"owned fixture").unwrap());
+        app.base_path = Some(root.join("saved.uie"));
+        app.base_dirty = true;
+        assert!(!app.save_base());
+        assert!(app.source_save_rx.is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (app.source_save_rx.is_some() || app.base_save_rx.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.busy, "{}", app.status);
+        let project = crate::project::open(&root.join("saved.uie")).unwrap();
+        let recovered = project
+            .source_sha256
+            .keys()
+            .find(|p| p.starts_with("source/recovered"))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(project.output.join(recovered)).unwrap(),
+            "recovered"
+        );
+        assert_eq!(fs::read_to_string(original).unwrap(), "old");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn history_restores_symbols_after_rename_and_redo() {
+        let mut doc = Document::new(
+            PathBuf::from("source/test.py"),
+            "def first():\n    return 1\n".into(),
+        );
+        doc.replace_text("def renamed():\n    return 1\n".into());
+        assert!(doc.symbols[0].1.contains("renamed"));
+        assert!(doc.navigate_history(false));
+        assert!(doc.symbols[0].1.contains("first"));
+        assert!(doc.dirty);
+        assert!(doc.navigate_history(true));
+        assert!(doc.symbols[0].1.contains("renamed"));
+    }
+    #[test]
+    fn android_workspace_opens_java_manifest_and_backend_report() {
+        let root =
+            std::env::temp_dir().join(format!("uie-android-workspace-{}", std::process::id()));
+        fs::create_dir_all(root.join("source/java/sample")).unwrap();
+        fs::create_dir_all(root.join("source/resources")).unwrap();
+        fs::write(
+            root.join("source/java/sample/Hello.java"),
+            "public class Hello {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("source/resources/AndroidManifest.xml"),
+            "<manifest package=\"sample\"/>\n",
+        )
+        .unwrap();
+        fs::write(root.join("android-report.json"), "{\"source_files\":1}").unwrap();
+        let workspace = LoadedWorkspace::read(root.clone(), Session::default());
+        assert_eq!(workspace.files.len(), 2);
+        assert!(workspace
+            .android_report
+            .as_ref()
+            .unwrap()
+            .contains("source_files"));
+        assert!(
+            workspace.documents[workspace.active.unwrap()]
+                .path
+                .extension()
+                .unwrap()
+                == "java"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn database_save_runs_in_a_worker_and_only_clears_dirty_state_on_success() {
+        let context = egui::Context::default();
+        let avatar = context.load_texture(
+            "save-worker",
+            egui::ColorImage::new([1, 1], Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = Toker::new(None, avatar);
+        let root = std::env::temp_dir().join(format!("uie-save-worker-{}", std::process::id()));
+        fs::create_dir_all(root.join("source")).unwrap();
+        let source = root.join("source/main.py");
+        fs::write(&source, "answer=42\n".repeat(100000)).unwrap();
+        app.output = Some(root.clone());
+        app.analysis = Some(crate::detect::inspect(b"fixture").unwrap());
+        app.base_path = Some(root.join("saved.uie"));
+        app.base_dirty = true;
+        assert!(!app.save_base());
+        assert!(app.base_save_rx.is_some() && app.busy && app.base_dirty);
+        assert!(!app.save_base());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.base_save_rx.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.base_save_rx.is_none() && !app.busy && !app.base_dirty);
+        assert!(root.join("saved.uie").is_file());
+        app.base_path = Some(root.join("missing-parent/bad.uie"));
+        app.base_dirty = true;
+        app.save_base();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.base_save_rx.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.base_save_rx.is_none() && !app.busy && app.base_dirty);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn project_verification_and_document_loading_run_off_the_ui_thread() {
         let context = egui::Context::default();

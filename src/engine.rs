@@ -38,6 +38,11 @@ pub struct Settings {
     pub offline: bool,
     pub hide_updates: bool,
     pub lazy_native: bool,
+    pub decompiler_plugin: Option<String>,
+    pub analysis_limits: crate::process_limits::Policy,
+    pub background: crate::background::Config,
+    pub autosave: bool,
+    pub theme: crate::theme::Theme,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -55,6 +60,11 @@ impl Default for Settings {
             offline: false,
             hide_updates: false,
             lazy_native: true,
+            decompiler_plugin: None,
+            analysis_limits: crate::process_limits::Policy::default(),
+            background: crate::background::Config::default(),
+            autosave: true,
+            theme: crate::theme::Theme::default(),
         }
     }
 }
@@ -235,6 +245,9 @@ fn feed_output(pending: &mut Vec<u8>, bytes: &[u8], events: &Sender<Event>) {
                 }
                 _ => (),
             }
+        } else if let Some(progress) = crate::android::progress(&line) {
+            let _ = events.send(Event::Progress(progress));
+            log(events, line);
         } else if !line.is_empty() {
             log(events, line);
         }
@@ -257,6 +270,43 @@ fn drain(file: &mut File, events: &Sender<Event>, pending: &mut Vec<u8>) -> Resu
     Ok(())
 }
 
+fn jadx_environment(command: &mut Command, cwd: &Path) -> Result<(), String> {
+    let config = cwd.join(".jadx-config");
+    let cache = cwd.join(".jadx-cache");
+    fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    command
+        .env("JADX_CONFIG_DIR", config)
+        .env("JADX_CACHE_DIR", cache);
+    for key in [
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "CLASSPATH",
+    ] {
+        command.env_remove(key);
+    }
+    Ok(())
+}
+
+thread_local! {
+    static ANALYSIS_POLICY: std::cell::RefCell<crate::process_limits::Policy> = std::cell::RefCell::new(crate::process_limits::Policy::default());
+}
+pub fn set_analysis_policy(policy: crate::process_limits::Policy) {
+    ANALYSIS_POLICY.with(|active| *active.borrow_mut() = policy);
+}
+pub fn run_analysis_tool(
+    tool: &str,
+    args: &[OsString],
+    cwd: &Path,
+    log_path: &Path,
+    timeout: u64,
+    cancel: &AtomicBool,
+    events: &Sender<Event>,
+) -> Result<(), String> {
+    run_tool_internal(tool, args, cwd, log_path, timeout, cancel, events, true)
+}
+
 pub fn run_tool(
     tool: &str,
     args: &[OsString],
@@ -265,6 +315,19 @@ pub fn run_tool(
     timeout: u64,
     cancel: &AtomicBool,
     events: &Sender<Event>,
+) -> Result<(), String> {
+    run_tool_internal(tool, args, cwd, log_path, timeout, cancel, events, false)
+}
+#[allow(clippy::too_many_arguments)] // Shared runner preserves the public tool invocation signature.
+fn run_tool_internal(
+    tool: &str,
+    args: &[OsString],
+    cwd: &Path,
+    log_path: &Path,
+    timeout: u64,
+    cancel: &AtomicBool,
+    events: &Sender<Event>,
+    force_limits: bool,
 ) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("отменено".into());
@@ -325,6 +388,28 @@ pub fn run_tool(
         }
     }
     command.envs(crate::runtime::environment());
+    if args.iter().any(|arg| arg == "jadx.cli.JadxCLI") {
+        jadx_environment(&mut command, cwd)?;
+    }
+    if let Some(root) = crate::runtime::toolchain_root(&tool) {
+        let mut paths = vec![root.join("uv")];
+        if let Some(parent) = tool.parent() {
+            paths.push(parent.to_path_buf());
+        }
+        let inherited = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value.map(OsString::from))
+            .or_else(|| env::var_os("PATH"));
+        if let Some(path) = inherited {
+            paths.extend(env::split_paths(&path));
+        }
+        command.env(
+            "PATH",
+            env::join_paths(paths).map_err(|error| error.to_string())?,
+        );
+        command.env("UV_PYTHON_INSTALL_DIR", root.join("python"));
+    }
     command.env("HF_HUB_DOWNLOAD_TIMEOUT", "30");
     if args.iter().any(|arg| {
         Path::new(arg)
@@ -340,13 +425,45 @@ pub fn run_tool(
             command.env_remove(key);
         }
     }
+    let name = tool
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let analysis = force_limits
+        || [
+            "java",
+            "python",
+            "python3",
+            "diec",
+            "pylingual",
+            "pyinstxtractor-ng",
+            "ilspycmd",
+            "analyzeheadless",
+            "retdec-decompiler",
+            "upx",
+        ]
+        .contains(&name.as_str());
+    let policy = ANALYSIS_POLICY.with(|active| active.borrow().clone());
+    if analysis {
+        crate::process_limits::configure_command(&mut command, &policy)?;
+    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("{}: {e}", tool.display()))?;
+    let _isolation = if analysis {
+        Some(crate::process_limits::attach(&mut child, &policy)?)
+    } else {
+        None
+    };
     let start = Instant::now();
     let mut pending = vec![];
     loop {
-        let _ = drain(&mut reader, events, &mut pending);
+        if let Err(error) = drain(&mut reader, events, &mut pending) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("cannot read engine log: {error}"));
+        }
         if cancel.load(Ordering::Relaxed) || start.elapsed().as_secs() >= timeout {
             #[cfg(windows)]
             {
@@ -364,10 +481,18 @@ pub fn run_tool(
             });
         }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            while reader.stream_position().unwrap_or(0)
-                < reader.metadata().map_err(|e| e.to_string())?.len()
-            {
+            // Descendants may keep writing after the main process exits.
+            // Read only the exit snapshot rather than chase a moving EOF forever.
+            let final_length = reader.metadata().map_err(|e| e.to_string())?.len();
+            while reader.stream_position().map_err(|e| e.to_string())? < final_length {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("отменено".into());
+                }
+                let before = reader.stream_position().map_err(|e| e.to_string())?;
                 drain(&mut reader, events, &mut pending)?;
+                if reader.stream_position().map_err(|e| e.to_string())? <= before {
+                    return Err("engine log was truncated while reading".into());
+                }
             }
             if !pending.is_empty() {
                 feed_output(&mut pending, b"\n", events);
@@ -385,7 +510,6 @@ pub fn run_tool(
     }
 }
 
-#[cfg(test)]
 fn new_output(parent: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let parent = canonical_path(parent)?;
@@ -607,6 +731,11 @@ fn decompile_python(
             include_str!("model_download.py"),
         )
         .map_err(|e| e.to_string())?;
+        fs::write(
+            output.join("python_recovery.py"),
+            include_str!("python_recovery.py"),
+        )
+        .map_err(|e| e.to_string())?;
         fs::write(&bridge, include_str!("pylingual_bridge.py")).map_err(|e| e.to_string())?;
         args.push(bridge.into_os_string());
     }
@@ -765,6 +894,44 @@ impl Drop for GhidraSelectionWork {
     }
 }
 
+fn semantic_ir_path(source: &Path) -> PathBuf {
+    let mut name = source.as_os_str().to_os_string();
+    name.push(".python-ir.json");
+    PathBuf::from(name)
+}
+
+fn copy_semantic_ir(staged: &Path, result: &Path) -> Result<(), String> {
+    let source = semantic_ir_path(staged);
+    let mut input = match File::open(&source) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    const MAX_IR: u64 = 64 * 1024 * 1024;
+    let size = input.metadata().map_err(|error| error.to_string())?.len();
+    if size > MAX_IR {
+        return Err("semantic IR exceeds 64 MiB".into());
+    }
+    let target = semantic_ir_path(result);
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|error| error.to_string())?;
+    let copied = std::io::copy(&mut (&mut input).take(MAX_IR + 1), &mut output)
+        .map_err(|error| error.to_string());
+    match copied {
+        Ok(count) if count == size => Ok(()),
+        result => {
+            drop(output);
+            let _ = fs::remove_file(target);
+            Err(result
+                .err()
+                .unwrap_or_else(|| "semantic IR changed during copy".into()))
+        }
+    }
+}
+
 fn ghidra_selected_range(
     mut settings: Settings,
     root: &Path,
@@ -797,6 +964,16 @@ fn ghidra_selected_range(
         include_str!("UiePythonTypes.java"),
     )
     .map_err(|e| e.to_string())?;
+    fs::write(
+        work.join("UiePythonIR.java"),
+        include_str!("UiePythonIR.java"),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        work.join("UieNativeRuntime.java"),
+        include_str!("UieNativeRuntime.java"),
+    )
+    .map_err(|e| e.to_string())?;
     let temporary = work.join("function.c");
     run_tool(
         &settings.ghidra,
@@ -819,7 +996,7 @@ fn ghidra_selected_range(
             "-deleteProject".into(),
         ],
         &work,
-        &root.join(format!("lazy-{start:x}-ghidra.log")),
+        &new_output(&root.join("lazy-logs"))?.join(format!("{start:x}-ghidra.log")),
         u64::MAX,
         cancel,
         &tx,
@@ -839,6 +1016,11 @@ fn ghidra_selected_range(
         let _ = fs::remove_file(result);
         return Err(error.to_string());
     }
+    if let Err(error) = copy_semantic_ir(&temporary, result) {
+        drop(destination);
+        let _ = fs::remove_file(result);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -848,6 +1030,7 @@ pub fn lazy_function_with_cancel(
     address: &str,
     cancel: &AtomicBool,
 ) -> Result<PathBuf, String> {
+    set_analysis_policy(settings.analysis_limits.clone());
     if cancel.load(Ordering::Relaxed) {
         return Err("отменено".into());
     }
@@ -883,6 +1066,11 @@ pub fn lazy_function_with_cancel(
                     .as_str()
                     .ok_or("missing original binary path")?,
             );
+            let input = if input.is_absolute() {
+                input
+            } else {
+                root.join(input)
+            };
             if crate::project::sha256(&input)?
                 != report["native_input_sha256"].as_str().unwrap_or("")
             {
@@ -960,6 +1148,16 @@ pub fn lazy_function_with_cancel(
     )
     .map_err(|e| e.to_string())?;
     fs::write(
+        scripts.join("UiePythonIR.java"),
+        include_str!("UiePythonIR.java"),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        scripts.join("UieNativeRuntime.java"),
+        include_str!("UieNativeRuntime.java"),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
         scripts.join("UieFunction.java"),
         include_str!("UieFunction.java")
             .replace("FUNCTION_TIMEOUT", &FUNCTION_TIMEOUT_SECONDS.to_string()),
@@ -986,7 +1184,7 @@ pub fn lazy_function_with_cancel(
             address.into(),
         ],
         root,
-        &root.join(format!("lazy-{address}.log")),
+        &new_output(&root.join("lazy-logs"))?.join(format!("{address}-ghidra.log")),
         u64::MAX,
         cancel,
         &tx,
@@ -1001,6 +1199,11 @@ pub fn lazy_function_with_cancel(
                     .as_str()
                     .ok_or("missing original binary path for RetDec")?,
             );
+            let input = if input.is_absolute() {
+                input
+            } else {
+                root.join(input)
+            };
             if crate::project::sha256(&input)?
                 != report["native_input_sha256"].as_str().unwrap_or("")
             {
@@ -1039,7 +1242,12 @@ pub fn lazy_function_with_cancel(
             }));
         }
     }
-    fs::rename(temporary, &result).map_err(|e| e.to_string())?;
+    copy_semantic_ir(&temporary, &result)?;
+    if let Err(error) = fs::rename(&temporary, &result) {
+        let _ = fs::remove_file(semantic_ir_path(&result));
+        return Err(error.to_string());
+    }
+    let _ = fs::remove_file(semantic_ir_path(&temporary));
     Ok(result)
 }
 
@@ -1115,6 +1323,16 @@ fn decompile_native(
     fs::write(
         scripts.join("UiePythonTypes.java"),
         include_str!("UiePythonTypes.java"),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        scripts.join("UiePythonIR.java"),
+        include_str!("UiePythonIR.java"),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        scripts.join("UieNativeRuntime.java"),
+        include_str!("UieNativeRuntime.java"),
     )
     .map_err(|e| e.to_string())?;
     let filename = format!(
@@ -1285,16 +1503,22 @@ pub fn job(
     events: Sender<Event>,
 ) {
     crate::runtime::set_offline(settings.offline);
+    set_analysis_policy(settings.analysis_limits.clone());
     let mut result_path = None;
     let result = (|| -> Result<Option<PathBuf>, String> {
         let _ = events.send(Event::stage(0, "чтение заголовков и сигнатур".into()));
         let input = canonical_path(&input)?;
         let mut analysis = inspect_file(&input)?;
+        if let Some(id) = &settings.decompiler_plugin {
+            analysis
+                .notes
+                .push(format!("Explicit external decompiler: {id}"));
+        }
         let mut indicators = crate::indicators::inspect(&input, &cancel)?;
         let input_hash = indicators.sha256.clone();
         let _ = events.send(Event::Indicators(indicators.clone()));
         let _ = events.send(Event::Identity(input_hash.clone()));
-        if decompile && !settings.force_rebuild {
+        if decompile && settings.decompiler_plugin.is_none() && !settings.force_rebuild {
             match crate::project::cached(
                 &input_hash,
                 settings.all_modules,
@@ -1328,15 +1552,17 @@ pub fn job(
         let _ = events.send(Event::Output(output.clone()));
         write_json(&output.join("indicators.json"), &indicators)?;
         let _ = events.send(Event::stage(1, "подготовка встроенных движков".into()));
-        crate::runtime::prepare(
-            &mut settings,
-            &analysis.route,
-            decompile,
-            &output,
-            &cancel,
-            &events,
-        )?;
-        if decompile {
+        if settings.decompiler_plugin.is_none() {
+            crate::runtime::prepare(
+                &mut settings,
+                &analysis.route,
+                decompile,
+                &output,
+                &cancel,
+                &events,
+            )?;
+        }
+        if decompile && settings.decompiler_plugin.is_none() {
             match analysis.route {
                 Route::PythonArchive => {
                     required(&settings.extractor, "pyinstxtractor-ng.exe")?;
@@ -1345,7 +1571,7 @@ pub fn job(
                 Route::PythonBytecode => required(&settings.pylingual, "pylingual.exe")?,
                 Route::DotNet => required(&settings.ilspy, "ilspycmd.exe")?,
                 Route::Native => required(&settings.ghidra, "analyzeHeadless.bat")?,
-                Route::Asar | Route::Java => (),
+                Route::Asar | Route::Java | Route::Android => (),
                 Route::Unknown => {
                     return Err(
                         "формат не распознан; автоматическая декомпиляция недоступна".into(),
@@ -1417,7 +1643,7 @@ pub fn job(
         }
         let mut unpack_error = None;
         let mut primary_input = input.clone();
-        if crate::unpack::indicated(&analysis) {
+        if settings.decompiler_plugin.is_none() && crate::unpack::indicated(&analysis) {
             let _ = events.send(Event::stage(
                 3,
                 "UPX: decompressing a copy; target is not executed".into(),
@@ -1467,7 +1693,11 @@ pub fn job(
         if analysis.route == Route::Native {
             let _ = events.send(Event::stage(3, "поиск соседних модулей".into()));
         }
-        let plan = crate::triage::discover(&input, &analysis)?;
+        let plan = if settings.decompiler_plugin.is_some() {
+            crate::triage::Plan::default()
+        } else {
+            crate::triage::discover(&input, &analysis)?
+        };
         let dependency_snapshot = crate::project::dependency_snapshot(&input, &plan.modules)?;
         write_json(&output.join("triage-report.json"), &plan)?;
         if !plan.triggers.is_empty() {
@@ -1480,34 +1710,51 @@ pub fn job(
                 ),
             );
         }
-        let primary_result = match analysis.route {
-            Route::Asar => {
-                let _ = events.send(Event::stage(3, "ASAR extraction".into()));
-                crate::archives::asar(&primary_input, &output, &cancel, &events)
+        let primary_result = if let Some(id) = settings.decompiler_plugin.as_deref() {
+            let _ = events.send(Event::stage(4, format!("plugin: {id}")));
+            crate::plugins::run(id, &primary_input, &settings, &output, &cancel, &events)
+        } else {
+            match analysis.route {
+                Route::Asar => {
+                    let _ = events.send(Event::stage(3, "ASAR extraction".into()));
+                    crate::archives::asar(&primary_input, &output, &cancel, &events)
+                }
+                Route::Java => {
+                    let _ = events.send(Event::stage(4, "Java → CFR".into()));
+                    crate::archives::java(&primary_input, &mut settings, &output, &cancel, &events)
+                }
+                Route::Android => {
+                    let _ = events.send(Event::stage(4, "декомпиляция Android через JADX".into()));
+                    crate::android::decompile(
+                        &primary_input,
+                        &mut settings,
+                        &output,
+                        &cancel,
+                        &events,
+                    )
+                }
+                Route::PythonArchive | Route::PythonBytecode => decompile_python(
+                    &primary_input,
+                    &analysis,
+                    &settings,
+                    &output,
+                    Path::new(""),
+                    &cancel,
+                    &events,
+                ),
+                Route::DotNet => {
+                    decompile_dotnet(&primary_input, &settings, &output, &cancel, &events)
+                }
+                Route::Native => decompile_native(
+                    &primary_input,
+                    &settings,
+                    &output,
+                    Path::new(""),
+                    &cancel,
+                    &events,
+                ),
+                Route::Unknown => unreachable!(),
             }
-            Route::Java => {
-                let _ = events.send(Event::stage(4, "Java → CFR".into()));
-                crate::archives::java(&primary_input, &mut settings, &output, &cancel, &events)
-            }
-            Route::PythonArchive | Route::PythonBytecode => decompile_python(
-                &primary_input,
-                &analysis,
-                &settings,
-                &output,
-                Path::new(""),
-                &cancel,
-                &events,
-            ),
-            Route::DotNet => decompile_dotnet(&primary_input, &settings, &output, &cancel, &events),
-            Route::Native => decompile_native(
-                &primary_input,
-                &settings,
-                &output,
-                Path::new(""),
-                &cancel,
-                &events,
-            ),
-            Route::Unknown => unreachable!(),
         };
         let mut errors = primary_result.err().into_iter().collect::<Vec<_>>();
         errors.extend(unpack_error);
@@ -1576,6 +1823,13 @@ pub fn job(
                         &cancel,
                         &events,
                     ),
+                    Route::Android => crate::android::decompile(
+                        &module.path,
+                        &mut settings,
+                        &module_output,
+                        &cancel,
+                        &events,
+                    ),
                     Route::Unknown => Err("формат модуля не поддержан".into()),
                 }
             })();
@@ -1599,15 +1853,17 @@ pub fn job(
         if !errors.is_empty() {
             return Err(errors.join("; "));
         }
-        if let Err(error) = crate::project::save(
-            &input_hash,
-            &output,
-            settings.all_modules,
-            &analysis,
-            &input,
-            &dependency_snapshot,
-        ) {
-            log(&events, format!("не удалось сохранить проект: {error}"));
+        if settings.decompiler_plugin.is_none() {
+            if let Err(error) = crate::project::save(
+                &input_hash,
+                &output,
+                settings.all_modules,
+                &analysis,
+                &input,
+                &dependency_snapshot,
+            ) {
+                log(&events, format!("не удалось сохранить проект: {error}"));
+            }
         }
         Ok(Some(output))
     })();
@@ -1633,7 +1889,52 @@ const GHIDRA_SCRIPT: &str = include_str!("UieExport.java");
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jadx_uses_owned_configuration_and_removes_java_startup_injection() {
+        let root = new_output(&std::env::temp_dir()).unwrap();
+        let mut command = Command::new("owned-java-fixture-never-executed");
+        for key in [
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "CLASSPATH",
+        ] {
+            command.env(key, "untrusted inherited fixture");
+        }
+        jadx_environment(&mut command, &root).unwrap();
+        let variables: std::collections::HashMap<_, _> = command.get_envs().collect();
+        for key in [
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "CLASSPATH",
+        ] {
+            assert_eq!(variables[std::ffi::OsStr::new(key)], None);
+        }
+        assert_eq!(
+            variables[std::ffi::OsStr::new("JADX_CONFIG_DIR")],
+            Some(root.join(".jadx-config").as_os_str())
+        );
+        assert!(root.join(".jadx-cache").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
 
+    #[test]
+    fn selected_function_keeps_semantic_ir_outside_the_temporary_work_directory() {
+        let root = std::env::temp_dir().join(format!("uie-semantic-ir-{}", std::process::id()));
+        fs::create_dir_all(root.join("temporary")).unwrap();
+        let staged = root.join("temporary/function.c");
+        let output = root.join("FUN_180001000.c");
+        fs::write(semantic_ir_path(&staged), b"{\"operations\":[]}").unwrap();
+        copy_semantic_ir(&staged, &output).unwrap();
+        fs::remove_dir_all(root.join("temporary")).unwrap();
+        assert_eq!(
+            fs::read(semantic_ir_path(&output)).unwrap(),
+            b"{\"operations\":[]}"
+        );
+        copy_semantic_ir(&root.join("missing.c"), &root.join("native.c")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn selected_ghidra_workspace_is_removed_on_early_error() {
         let root = std::env::temp_dir().join(format!("uie-ghidra-cleanup-{}", std::process::id()));

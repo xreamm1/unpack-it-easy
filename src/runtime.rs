@@ -117,6 +117,20 @@ pub fn environment() -> Vec<(String, OsString)> {
     vars
 }
 
+/// Resolve a managed Python toolchain beside the executable actually being used.
+pub fn toolchain_root(tool: &Path) -> Option<PathBuf> {
+    let uv = if cfg!(windows) { "uv/uv.exe" } else { "uv/uv" };
+    tool.parent()?
+        .ancestors()
+        .take(6)
+        .find(|root| {
+            root.join("engines.json").is_file()
+                && root.join(uv).is_file()
+                && root.join("python").is_dir()
+        })
+        .map(Path::to_path_buf)
+}
+
 pub fn java() -> PathBuf {
     environment()
         .into_iter()
@@ -155,10 +169,10 @@ pub fn prepare(
             Route::PythonBytecode => exists(&settings.pylingual),
             Route::DotNet => exists(&settings.ilspy),
             Route::Native => exists(&settings.ghidra),
-            Route::Java => java().is_file(),
+            Route::Java | Route::Android => java().is_file(),
             Route::Asar | Route::Unknown => true,
         };
-    if backend_ready && (exists(&settings.diec) || !cfg!(windows)) {
+    if backend_ready && (exists(&settings.diec) || !cfg!(windows) || *route == Route::Android) {
         return Ok(());
     }
     if settings.offline || is_offline() {
@@ -181,7 +195,7 @@ pub fn prepare(
             Route::PythonArchive | Route::PythonBytecode => "python",
             Route::DotNet => "dotnet",
             Route::Native => "native",
-            Route::Java => "java",
+            Route::Java | Route::Android => "java",
             Route::Asar | Route::Unknown => "detect",
         }
     };
@@ -257,6 +271,7 @@ pub fn prepare_offline(
             prepare(&mut settings, &route, true, &output, &cancel, &events)?;
         }
         crate::archives::prepare_cfr(&output, &cancel, &events)?;
+        crate::android::prepare(&output, &cancel, &events)?;
         if cfg!(any(windows, target_os = "linux")) {
             crate::unpack::prepare(false, &output, &cancel, &events)?;
         } else {
@@ -298,6 +313,22 @@ pub fn prepare_offline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn toolchain_is_resolved_from_the_actual_python_not_the_gui_directory() {
+        let root = std::env::temp_dir().join(format!("uie-toolchain-{}", std::process::id()));
+        fs::create_dir_all(root.join("uv")).unwrap();
+        fs::create_dir_all(root.join("python/cpython-owned")).unwrap();
+        fs::write(root.join("engines.json"), "{}").unwrap();
+        let uv = root.join(if cfg!(windows) { "uv/uv.exe" } else { "uv/uv" });
+        fs::write(&uv, "fixture; never executed").unwrap();
+        assert_eq!(
+            toolchain_root(&root.join("python/cpython-owned/python.exe")),
+            Some(root.clone())
+        );
+        fs::remove_file(uv).unwrap();
+        assert!(toolchain_root(&root.join("python/cpython-owned/python.exe")).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn repeated_offline_preparation_has_fresh_log_paths() {
         let root = std::env::temp_dir().join(format!("uie-offline-retry-{}", std::process::id()));

@@ -21,7 +21,7 @@ struct Bits {
     known: u64,
     transformed: bool,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     registers: HashMap<Register, Bits>,
     memory: BTreeMap<u64, u8>,
@@ -418,12 +418,201 @@ fn rotate(value: u64, count: u64, width: u32, left: bool) -> u64 {
     }
 }
 
+// A forward-only DAG meet preserves existing concrete loop unrolling. Backedges
+// and oversized graphs deliberately fall back to the unknown-state path.
+fn meet(left: &mut State, right: &State) {
+    left.registers.retain(|reg, bits| {
+        let other = right.registers.get(reg).copied().unwrap_or_default();
+        bits.known &= other.known & !(bits.value ^ other.value);
+        bits.value &= bits.known;
+        bits.transformed &= other.transformed;
+        bits.known != 0
+    });
+    left.memory
+        .retain(|address, value| right.memory.get(address) == Some(value));
+    left.transformed
+        .retain(|address| left.memory.contains_key(address) && right.transformed.contains(address));
+    if left.zero != right.zero {
+        left.zero = None;
+    }
+    if left.carry != right.carry {
+        left.carry = None;
+    }
+    left.image_reads &= right.image_reads;
+}
+fn join_transfer(
+    state: &mut State,
+    image: &Image<'_>,
+    instruction: &Instruction,
+    factory: &mut InstructionInfoFactory,
+) {
+    if matches!(
+        instruction.flow_control(),
+        FlowControl::Call | FlowControl::IndirectCall
+    ) {
+        for reg in [
+            Register::RAX,
+            Register::RCX,
+            Register::RDX,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+        ] {
+            state.registers.remove(&reg);
+        }
+        state.memory.clear();
+        state.transformed.clear();
+        state.image_reads = false;
+        state.zero = None;
+        state.carry = None;
+        return;
+    }
+    if instruction.has_lock_prefix()
+        || instruction.has_segment_prefix()
+        || instruction.has_rep_prefix()
+        || instruction.has_repne_prefix()
+    {
+        state.forget_effects(instruction, factory);
+        return;
+    }
+    let width = if instruction.op0_kind() == OpKind::Register {
+        view(instruction.op0_register()).map(|(_, w, _)| w)
+    } else if instruction.op0_kind() == OpKind::Memory {
+        Some(instruction.memory_size().size() as u32 * 8)
+    } else {
+        None
+    };
+    let Some(width) = width.filter(|w| matches!(w, 8 | 16 | 32 | 64)) else {
+        state.forget_effects(instruction, factory);
+        return;
+    };
+    let a = state.operand(image, instruction, 0);
+    let b = if instruction.op_count() > 1 {
+        state.operand(image, instruction, 1)
+    } else {
+        None
+    };
+    let mnemonic = instruction.mnemonic();
+    let value = match mnemonic {
+        Mnemonic::Mov | Mnemonic::Movzx => b,
+        Mnemonic::Lea => state.address(instruction),
+        Mnemonic::Xor | Mnemonic::Sub
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Register
+                && instruction.op0_register() == instruction.op1_register() =>
+        {
+            Some(0)
+        }
+        Mnemonic::Xor => a.zip(b).map(|(a, b)| a ^ b),
+        Mnemonic::And => a.zip(b).map(|(a, b)| a & b),
+        Mnemonic::Or => a.zip(b).map(|(a, b)| a | b),
+        Mnemonic::Add => a.zip(b).map(|(a, b)| a.wrapping_add(b)),
+        Mnemonic::Sub => a.zip(b).map(|(a, b)| a.wrapping_sub(b)),
+        Mnemonic::Shl => a
+            .zip(b)
+            .map(|(a, b)| a.wrapping_shl((b & if width == 64 { 63 } else { 31 }) as u32)),
+        Mnemonic::Shr => a
+            .zip(b)
+            .map(|(a, b)| a.wrapping_shr((b & if width == 64 { 63 } else { 31 }) as u32)),
+        Mnemonic::Rol | Mnemonic::Ror => a
+            .zip(b)
+            .map(|(a, b)| rotate(a, b, width, mnemonic == Mnemonic::Rol)),
+        _ => {
+            state.forget_effects(instruction, factory);
+            return;
+        }
+    }
+    .map(|v| v & mask(width));
+    let derived = state.derived(instruction, 0)
+        || (instruction.op_count() > 1 && state.derived(instruction, 1))
+        || !matches!(mnemonic, Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Lea);
+    state.store(instruction, value, derived);
+    if instruction.rflags_modified() != 0 {
+        state.zero = None;
+        state.carry = None;
+    }
+}
+fn forward_join(
+    instructions: &BTreeMap<u64, Instruction>,
+    image: &Image<'_>,
+    state: &State,
+    branch: &Instruction,
+    cancel: &AtomicBool,
+    budget: usize,
+) -> Result<(Option<(u64, State)>, usize), String> {
+    let first = branch.next_ip();
+    let second = branch.near_branch_target();
+    if second <= branch.ip() {
+        return Ok((None, 0));
+    }
+    let mut pending: BTreeMap<u64, (State, u8)> = BTreeMap::new();
+    pending.insert(first, (state.clone(), 1));
+    if let Some((existing, origins)) = pending.get_mut(&second) {
+        meet(existing, state);
+        *origins |= 2;
+    } else {
+        pending.insert(second, (state.clone(), 2));
+    }
+    let mut factory = InstructionInfoFactory::new();
+    let mut steps = 0;
+    while let Some((ip, (mut state, origins))) = pending.pop_first() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if steps >= budget.min(256) {
+            return Ok((None, steps));
+        }
+        let Some(instruction) = instructions.get(&ip) else {
+            continue;
+        };
+        if origins == 3 {
+            return Ok((Some((ip, state)), steps));
+        }
+        steps += 1;
+        let mut successors = Vec::new();
+        if instruction.is_jmp_short_or_near() {
+            successors.push(instruction.near_branch_target());
+        } else if instruction.is_jcc_short_or_near() {
+            successors.push(instruction.next_ip());
+            successors.push(instruction.near_branch_target());
+        } else if matches!(
+            instruction.flow_control(),
+            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall
+        ) {
+            join_transfer(&mut state, image, instruction, &mut factory);
+            successors.push(instruction.next_ip());
+        }
+        for successor in successors {
+            if successor <= ip {
+                return Ok((None, steps));
+            }
+            if !instructions.contains_key(&successor) {
+                continue;
+            }
+            if let Some((existing, previous)) = pending.get_mut(&successor) {
+                meet(existing, &state);
+                *previous |= origins;
+            } else {
+                pending.insert(successor, (state.clone(), origins));
+            }
+        }
+    }
+    Ok((None, steps))
+}
+fn indirect_target(state: &State, image: &Image<'_>, instruction: &Instruction) -> Option<u64> {
+    let target = state.operand(image, instruction, 0)?;
+    let rva = u32::try_from(target.checked_sub(image.base)?).ok()?;
+    image.code(rva).ok()?;
+    Some(target)
+}
+
 pub(super) fn analyze(
     image: &Image<'_>,
     functions: &BTreeMap<u32, String>,
     cancel: &AtomicBool,
 ) -> Result<Report, String> {
-    let mut report = Report { engine: "UIE Rust bounded constant propagation", interpretation: "Static candidates, not observed execution or recovered application source. Only known branch conditions are followed; unresolved control flow loses tracked state. Calls invalidate volatile registers and memory. Stack addresses are synthetic relative offsets, never runtime addresses. Unknown reads are never replaced with zero. ASCII and BMP UTF-16LE candidates may include false positives.", steps: 0, truncated: false, annotations: vec![] };
+    let mut report = Report { engine: "UIE Rust bounded constant propagation", interpretation: "Static candidates, not observed execution or recovered application source. Known branches are followed and bounded forward branch joins retain only facts agreed by all explored predecessors; backward or oversized unresolved flow loses tracked state. Indirect targets are static address candidates, not observed calls. Calls invalidate volatile registers and memory. Stack addresses are synthetic relative offsets, never runtime addresses. Unknown reads are never replaced with zero. ASCII and BMP UTF-16LE candidates may include false positives.", steps: 0, truncated: false, annotations: vec![] };
     for &function in functions.keys() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -431,7 +620,13 @@ pub(super) fn analyze(
         let Ok(code) = image.code(function) else {
             continue;
         };
-        let start = image.base + u64::from(function);
+        let start = image
+            .base
+            .checked_add(u64::from(function))
+            .ok_or("native function address overflow")?;
+        start
+            .checked_add(code.len() as u64)
+            .ok_or("native code range overflow")?;
         let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::NONE);
         let mut instructions = BTreeMap::new();
         while decoder.can_decode() {
@@ -449,7 +644,12 @@ pub(super) fn analyze(
         let mut ip = start;
         let mut factory = InstructionInfoFactory::new();
         let mut emitted = HashSet::new();
+        let mut function_steps = 0;
         for step in 0..MAX_STEPS {
+            if function_steps >= MAX_STEPS {
+                report.truncated = true;
+                break;
+            }
             if report.steps >= MAX_TOTAL_STEPS || report.annotations.len() >= MAX_ANNOTATIONS {
                 report.truncated = true;
                 break;
@@ -458,6 +658,7 @@ pub(super) fn analyze(
                 report.truncated = true;
             }
             report.steps += 1;
+            function_steps += 1;
             let Some(instruction) = instructions.get(&ip) else {
                 break;
             };
@@ -482,6 +683,21 @@ pub(super) fn analyze(
                 instruction.flow_control(),
                 FlowControl::Call | FlowControl::IndirectCall
             ) {
+                if instruction.flow_control() == FlowControl::IndirectCall {
+                    if let Some(target) = indirect_target(&state, image, instruction) {
+                        if emitted.insert((ip, "call target".into(), location(target, image.base)))
+                        {
+                            report.annotations.push(Annotation {
+                                function_rva: format!("0x{function:x}"),
+                                instruction_rva: format!("0x{:x}", ip - image.base),
+                                kind: "indirect_call_target",
+                                location: "call target".into(),
+                                value: location(target, image.base),
+                                encoding: None,
+                            });
+                        }
+                    }
+                }
                 strings(&state, image, function, ip, &mut report.annotations);
                 for reg in [
                     Register::RAX,
@@ -524,10 +740,46 @@ pub(super) fn analyze(
                     };
                     continue;
                 }
+                let (join, extra) = forward_join(
+                    &instructions,
+                    image,
+                    &state,
+                    instruction,
+                    cancel,
+                    MAX_TOTAL_STEPS
+                        .saturating_sub(report.steps)
+                        .min(MAX_STEPS.saturating_sub(function_steps)),
+                )?;
+                report.steps += extra;
+                function_steps += extra;
+                if let Some((join, joined)) = join {
+                    state = joined;
+                    ip = join;
+                    continue;
+                }
                 strings(&state, image, function, ip, &mut report.annotations);
                 state = State::default();
                 ip = next;
                 continue;
+            }
+            if instruction.flow_control() == FlowControl::IndirectBranch {
+                if let Some(target) = indirect_target(&state, image, instruction) {
+                    if emitted.insert((ip, "jump target".into(), location(target, image.base))) {
+                        report.annotations.push(Annotation {
+                            function_rva: format!("0x{function:x}"),
+                            instruction_rva: format!("0x{:x}", ip - image.base),
+                            kind: "indirect_jump_target",
+                            location: "jump target".into(),
+                            value: location(target, image.base),
+                            encoding: None,
+                        });
+                    }
+                    if instructions.contains_key(&target) {
+                        ip = target;
+                        continue;
+                    }
+                }
+                break;
             }
             if instruction.flow_control() != FlowControl::Next {
                 break;
@@ -783,6 +1035,61 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap()
+    }
+    #[test]
+    fn forward_diamond_keeps_only_agreed_values() {
+        let code = [
+            0x85, 0xc9, 0x74, 0x07, 0xb8, 42, 0, 0, 0, 0xeb, 0x05, 0xb8, 42, 0, 0, 0, 0x89, 0xc2,
+            0xc3,
+        ];
+        let report = scan(&code);
+        assert!(report
+            .annotations
+            .iter()
+            .any(|r| r.instruction_rva == "0x1010" && r.location == "EDX" && r.value == "0x2a"));
+        let mut differing = code;
+        differing[12] = 43;
+        let report = scan(&differing);
+        assert!(!report
+            .annotations
+            .iter()
+            .any(|r| r.instruction_rva == "0x1010" && r.location == "EDX"));
+    }
+    #[test]
+    fn calls_inside_a_diamond_clobber_volatile_values() {
+        let code = [
+            0xb8, 42, 0, 0, 0, 0x85, 0xc9, 0x74, 0x07, 0xe8, 0, 0, 0, 0, 0xeb, 0x01, 0x90, 0x89,
+            0xc2, 0xc3,
+        ];
+        let report = scan(&code);
+        assert!(!report.annotations.iter().any(|r| r.location == "EDX"));
+    }
+    #[test]
+    fn register_indirect_targets_are_static_and_call_clobbered() {
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&0x140001010u64.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xff, 0xd0, 0xc3, 0x90, 0xc3]);
+        let report = scan(&code);
+        assert_eq!(
+            report
+                .annotations
+                .iter()
+                .filter(|r| r.kind == "indirect_call_target")
+                .count(),
+            1
+        );
+        let mut jump = vec![0x48, 0xb8];
+        jump.extend_from_slice(&0x14000100cu64.to_le_bytes());
+        jump.extend_from_slice(&[0xff, 0xe0, 0xb9, 7, 0, 0, 0, 0xc3]);
+        let report = scan(&jump);
+        assert!(report
+            .annotations
+            .iter()
+            .any(|r| r.kind == "indirect_jump_target"));
+        assert!(report
+            .annotations
+            .iter()
+            .any(|r| r.location == "ECX" && r.value == "0x7"));
     }
     #[test]
     fn identities_resolve_unknown_register_inputs_without_inventing_them() {

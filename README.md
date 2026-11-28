@@ -68,6 +68,7 @@ Keep the downloaded `engines` folder beside `UIE.exe`. You do not need to instal
 | Nuitka and Cython builds, including launcher + `.pyd` layouts | Native C pseudocode, related modules, initialization and XREF candidates |
 | .NET assemblies | C# source |
 | Java `.jar` and `.class` | Java source |
+| Android `.apk` and `.dex` | Java through JADX, decoded manifest and resources when present; native JNI code requires separate analysis |
 | Electron `.asar` | Extracted JavaScript, TypeScript and resources present in the archive |
 | UIE `.uie` projects | Saved code, resources, reports and rename history |
 
@@ -83,9 +84,12 @@ Keep the downloaded `engines` folder beside `UIE.exe`. You do not need to instal
 - **Inspect native Python builds.** Related-module discovery, CRT filtering, constant-initializer candidates, section entropy and Python-string XREFs.
 - **Keep your work.** Save portable `.uie` databases, copy or export logs, and reopen edited files with their resources.
 - **Compare and continue elsewhere.** Compare projects and export native symbols and comments for x64dbg.
+- **Search and follow calls.** Search recovered files together, including unsaved edits, or navigate a static native call graph. Compare executable bytes and PE sections alongside existing project comparison.
+- **Configure analysis.** Select an enabled external decompiler plugin, set Windows analysis memory/process limits, and control background animation and adaptive refresh from settings. [Settings and limits](docs/usage.md#analysis-tools-and-settings).
+- **Check recovery and share diagnostics.** An owned Java/Android regression corpus checks recovered code by recompiling and running assertions. Crash Assistant redacts common secrets in exported reports and email attachments. [Quality checks](docs/quality.md).
 - **Use a debugger when needed.** Optional x64dbg/x32dbg integration on Windows. Starting a sample under the debugger is an explicit action; normal static analysis does not run input executables.
 
-UIE combines its Rust passes with Detect It Easy, Ghidra, RetDec, PyLingual, ILSpy, CFR and UPX where applicable. Analysis backends retain their own capabilities and limits. See [third-party components and licenses](THIRD_PARTY.md).
+UIE combines its Rust passes with Detect It Easy, Ghidra, RetDec, PyLingual, ILSpy, CFR, JADX and UPX where applicable. Analysis backends retain their own capabilities and limits. See [third-party components and licenses](THIRD_PARTY.md).
 
 ## Prepare once, work offline
 

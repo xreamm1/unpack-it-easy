@@ -6,6 +6,7 @@ const PYINSTALLER_MAGIC: &[u8] = b"MEI\x0c\x0b\x0a\x0b\x0e";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Route {
+    Android,
     Asar,
     Java,
     PythonArchive,
@@ -18,6 +19,7 @@ pub enum Route {
 impl Route {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Android => "Android APK / DEX → JADX → Java",
             Self::Asar => "electron ASAR → JavaScript / TypeScript",
             Self::Java => "Java → CFR",
             Self::PythonArchive => "pyinstaller → pyinstxtractor-ng → pylingual",
@@ -100,6 +102,17 @@ pub fn inspect_file(path: &Path) -> Result<Analysis, String> {
         analysis.route = Route::Java;
         analysis.format = "Java archive / class".into();
         analysis.architecture = "JVM".into();
+    }
+    // Contents take precedence over extensions, including renamed APKs.
+    if data.starts_with(b"PK\x03\x04") {
+        if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(&data)) {
+            if archive.by_name("AndroidManifest.xml").is_ok() {
+                analysis.route = Route::Android;
+                analysis.format = "Android APK".into();
+                analysis.architecture = "Dalvik / ART".into();
+                analysis.notes.push("apk содержит bytecode и ресурсы; нативные JNI библиотеки требуют отдельного анализа".into());
+            }
+        }
     }
     Ok(analysis)
 }
@@ -221,6 +234,14 @@ pub fn inspect(data: &[u8]) -> Result<Analysis, String> {
             _ => format!("cpu {cpu}"),
         };
         result.route = Route::Native;
+    } else if data.len() >= 112
+        && data.starts_with(b"dex\n")
+        && data[4..7].iter().all(u8::is_ascii_digit)
+        && data[7] == 0
+    {
+        result.format = "Android DEX".into();
+        result.architecture = "Dalvik / ART".into();
+        result.route = Route::Android;
     } else if data.len() >= 16
         && data.get(2..4) == Some(b"\r\n")
         && matches!(read16(data, 0, false)?, 3370..=3999)
@@ -371,6 +392,32 @@ pub fn die_summary(value: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn android_dex_and_renamed_apk_use_android_instead_of_java() {
+        let mut dex = vec![0u8; 112];
+        dex[..8].copy_from_slice(b"dex\n035\0");
+        assert_eq!(inspect(&dex).unwrap().route, Route::Android);
+        assert_eq!(inspect(&dex[..16]).unwrap().route, Route::Unknown);
+        let path = std::env::temp_dir().join(format!("uie-renamed-apk-{}.jar", std::process::id()));
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        use std::io::Write;
+        archive
+            .start_file(
+                "AndroidManifest.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"owned identification fixture").unwrap();
+        archive
+            .start_file("classes.dex", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(&dex).unwrap();
+        archive.finish().unwrap();
+        let analysis = inspect_file(&path).unwrap();
+        assert_eq!(analysis.route, Route::Android);
+        assert_eq!(analysis.format, "Android APK");
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn pe(managed: bool, x64: bool) -> Vec<u8> {
         let mut data = vec![0; 512];
